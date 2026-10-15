@@ -698,10 +698,28 @@ let latestBossMonitor = null;
 
 function applyAutoZoom(v) { autoZoom = v !== false; }
 
+function bossDeathTime(time) {
+  return Number.isFinite(time) ? new Date(time).toLocaleTimeString('zh-CN', { hourCycle: 'h23' }) : '';
+}
+
 function bossLifeText(entity) {
-  if (entity.life === 'dead-confirmed') return '已确认死亡事件';
+  if (entity.life === 'dead-confirmed') {
+    const time = bossDeathTime(entity.diedAt);
+    return '已确认死亡事件' + (time ? ' · ' + time : '');
+  }
   if (entity.life === 'unconfirmed-at-end') return '战局结束，存活状态未确认';
   return '日志记录初始位置';
+}
+
+function bossLifeSummary(entities) {
+  const dead = entities.filter(entity => entity.life === 'dead-confirmed');
+  const alive = entities.filter(entity => entity.life === 'alive-estimated').length;
+  const unconfirmed = entities.filter(entity => entity.life === 'unconfirmed-at-end').length;
+  const parts = [`推测存活 ${alive}`, `死亡已确认 ${dead.length}`];
+  if (unconfirmed) parts.push(`战局结束未确认 ${unconfirmed}`);
+  const times = dead.map(entity => entity.diedAt).filter(Number.isFinite);
+  if (times.length) parts.push('最近死亡 ' + bossDeathTime(Math.max(...times)));
+  return parts.join(' · ');
 }
 
 function bossRow(label, value) {
@@ -751,7 +769,7 @@ function renderBossPanel(monitor) {
         const zone = entity.zone ? ` · ${entity.zone}` : '';
         return `${bossLifeText(entity)}${pos}${zone}`;
       }).join('；');
-      value = [plan, actual].filter(Boolean).join('；');
+      value = [plan, bossLifeSummary(row.entities), actual].filter(Boolean).join('；');
     } else if (plan) value = plan;
     else if (row.status === 'planned') value = `计划刷新${row.chance == null ? '' : ` · 概率 ${row.chance}%`}`;
     else if (row.status === 'not-planned') value = '本波未计划刷新';
@@ -760,7 +778,7 @@ function renderBossPanel(monitor) {
   }
   for (const row of (monitor.pmcs || []).filter(relevant)) {
     body.appendChild(bossRow(row.name,
-      `初始计划 ${row.initialPlanned} / ${row.initialNotPlanned} 未计划 · 已记录出现 ${row.spawned} · 后续计划 ${row.additionalPlanned} / ${row.additionalNotPlanned} 未计划`));
+      `初始计划 ${row.initialPlanned} / ${row.initialNotPlanned} 未计划 · 已记录出现 ${row.spawned}${row.entities.length ? ` · ${bossLifeSummary(row.entities)}` : ''} · 后续计划 ${row.additionalPlanned} / ${row.additionalNotPlanned} 未计划`));
   }
   if (monitor.btr && monitor.btr.status === 'confirmed' && monitor.btr.mapKey === mapKey) {
     const pos = monitor.btr.position ? ` · 初始 (${monitor.btr.position.x.toFixed(1)}, ${monitor.btr.position.z.toFixed(1)})` : '';

@@ -8,7 +8,7 @@ const { cdp, evaluate, waitFor, waitForTarget, sleep } = require('./lib/cdp');
 const { makeProfile, createReport } = require('./lib/suite');
 const ROOT = path.join(__dirname, '..');
 const PORT = Number(process.argv.find(a => a.startsWith('--port='))?.split('=')[1] || 9456);
-const report = createReport('首领监控图标稳定性');
+const report = createReport('首领监控死亡显示与图标稳定性');
 const stamp = '2026-10-15 12:00:';
 const line = (body, channel = 'application', at = '00') => `${stamp}${at}.000|1.2.0|Trace|${channel}|${body}\n`;
 async function run() {
@@ -33,7 +33,11 @@ async function run() {
       + line('scene preset path:maps/woods_preset.bundle rcid:woods.scenespreset.asset', 'application', '03')
       + line('GameStarted: Woods', 'application', '04'));
     fs.writeFileSync(path.join(dir, 'test backend_000.log'), line('---> Request: client/match/local/start', 'backend', '02'));
-    fs.writeFileSync(aiFile, line('Bot activate role:bossKilla pos:(1,2,3) profileId:one id:1', 'aiData', '05'));
+    fs.writeFileSync(aiFile, [
+      ['bossKilla', 'one', 1], ['pmcBEAR', 'bear1', 2], ['pmcBEAR', 'bear2', 3],
+      ['pmcUSEC', 'usec1', 4], ['pmcUSEC', 'usec2', 5],
+      ['followerBully', 'guard1', 6], ['followerBully', 'guard2', 7],
+    ].map(([role, profile, id]) => line(`Bot activate role:${role} pos:(1,2,3) profileId:${profile} id:${id}`, 'aiData', '05')).join(''));
     const launched = await launchReady({ port: PORT, userData: prof.userData, cwd: ROOT,
       match: t => t.url.endsWith('/map.html'), timeoutMs: 30000 });
     app = launched.app;
@@ -91,6 +95,56 @@ async function run() {
         result.bossStable && result.mapStable && result.removed === 0
           && result.states.length > 0 && result.states.every(s => s === 'local-pve'), JSON.stringify(result));
     }
+    const rowText = async name => evaluate(main.webSocketDebuggerUrl, `(() => {
+      const row = [...document.querySelectorAll('.boss-panel-row')]
+        .find(el => el.querySelector('strong').textContent === ${JSON.stringify(name)});
+      return row?.querySelector('span').textContent || '';
+    })()`);
+    const pmcsVisible = await waitFor(async () =>
+      (await rowText('AI PMC · BEAR')).includes('死亡已确认 0')
+      && (await rowText('AI PMC · USEC')).includes('死亡已确认 0'), 5000);
+    report.check('PMC 在未记录死亡时显示存活推测和死亡计数', pmcsVisible);
+    const deathLogs = (ids, at) => ids.map(id => line('bot dispose:' + id, 'aiData', at)
+      + line('Squad patrol reassigned', 'aiData', at)
+      + line('BotDied pos:(4,5,6)', 'aiData', at)).join('');
+    fs.appendFileSync(aiFile, deathLogs([1, 2, 4, 6], '07'));
+    for (const name of ['AI PMC · BEAR', 'AI PMC · USEC']) {
+      const updated = await waitFor(async () => {
+        const text = await rowText(name);
+        return text.includes('已记录出现 2') && text.includes('推测存活 1')
+          && text.includes('死亡已确认 1') && text.includes('最近死亡 12:00:07');
+      }, 5000);
+      report.check(name + ' 追加死亡日志后更新人数和死亡时间', updated);
+    }
+    const bossDead = await waitFor(async () => {
+      const text = await rowText('Killa');
+      return text.includes('已确认死亡事件') && text.includes('12:00:07');
+    }, 5000);
+    report.check('首领死亡状态和时间由实际日志管线更新', bossDead);
+    const guardDead = await waitFor(async () => {
+      const text = await rowText('Reshala 随从');
+      return text.includes('推测存活 1') && text.includes('死亡已确认 1')
+        && text.includes('已确认死亡事件') && text.includes('12:00:07');
+    }, 5000);
+    report.check('同类保镖分别保留存活与死亡状态', guardDead);
+    for (const [i, page] of pages.entries()) {
+      const result = await evaluate(page.webSocketDebuggerUrl, `(() => {
+        const old = window.__bossProbe.boss;
+        return { retained: old === document.querySelector('.boss-log-marker'),
+          dead: old.children[1].getAttribute('stroke') === '#a7b0bd' };
+      })()`);
+      report.check((i ? '悬浮地图' : '主地图') + '真实死亡日志更新图标且不闪烁', result.retained && result.dead, JSON.stringify(result));
+    }
+    fs.appendFileSync(aiFile, deathLogs([3, 7], '08')
+      + line('Bot activate role:pmcUSEC pos:(8,2,9) profileId:usec3 id:8', 'aiData', '08'));
+    const accumulated = await waitFor(async () => {
+      const bear = await rowText('AI PMC · BEAR'), usec = await rowText('AI PMC · USEC');
+      const guard = await rowText('Reshala 随从');
+      return bear.includes('推测存活 0') && bear.includes('死亡已确认 2') && bear.includes('最近死亡 12:00:08')
+        && usec.includes('已记录出现 3') && usec.includes('推测存活 2') && usec.includes('死亡已确认 1')
+        && guard.includes('推测存活 0') && guard.includes('死亡已确认 2');
+    }, 5000);
+    report.check('后续死亡与追加刷新分别累计，保留此前死亡记录', accumulated);
     // Directly exercise display changes without clearing the existing marker.
     for (const [i, page] of pages.entries()) {
       const result = await evaluate(page.webSocketDebuggerUrl, `(() => {

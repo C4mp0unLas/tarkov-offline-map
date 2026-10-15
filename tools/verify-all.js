@@ -45,7 +45,7 @@ const has = (f) => process.argv.includes(f);
 const SUITES = [
   // ---------------------------------------------------------------- 自起实例
   {
-    id: 'boss-monitor', title: '首领监控图标稳定性与在线隐藏',
+    id: 'boss-monitor', title: '首领监控死亡显示、图标稳定性与在线隐藏',
     script: 'verify-boss-monitor.js', kind: 'spawn', group: 'dev', port: 9456, timeoutMs: 120000,
   },
   {
