@@ -1,0 +1,136 @@
+name: Build & Release (Windows)
+
+# 触发方式
+#   1) push 到 main            -> 跑测试 + 构建，产物作为 Actions artifact 上传（不发布 Release）
+#   2) push tag v*             -> 跑测试 + 构建 + 自动创建/更新 GitHub Release 并上传 exe
+#   3) 手动 workflow_dispatch  -> 可选填版本号（会写入 package.json），构建并发布 Release
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '发布版本号（留空则用 package.json 里的版本）'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-windows:
+    name: Windows portable exe
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Offline pipeline simulation
+        run: npm run simulate
+
+      # 手动发布时可临时覆盖版本号（不改动已提交的文件，只作用于本次构建）
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.version }}" ]; then
+            npm version "${{ inputs.version }}" --no-git-tag-version --allow-same-version
+          fi
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION"       >> "$GITHUB_OUTPUT"
+          echo "构建版本: $VERSION"
+
+      - name: Build portable exe (electron-builder)
+        run: npm run dist
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+      - name: Collect artifacts & checksums
+        id: art
+        shell: bash
+        run: |
+          set -e
+          mkdir -p release
+          VERSION="${{ steps.ver.outputs.version }}"
+          SRC=$(ls dist/*.exe | head -n 1)
+          SIZE=$(du -h "$SRC" | cut -f1)
+          echo "产物: $SRC ($SIZE)"
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+          # Release 资源文件名统一用 ASCII（中文名在部分下载器/命令行里会被转义或截断）
+          cp "$SRC" "release/tarkov-offline-map-${VERSION}-win-x64-portable.exe"
+          cd release
+          sha256sum *.exe > SHA256SUMS.txt
+          ls -lh
+          cat SHA256SUMS.txt
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarkov-offline-map-${{ steps.ver.outputs.version }}-win-x64
+          path: release/*
+          if-no-files-found: error
+          retention-days: 30
+
+      # 正文 = 固定说明 + CHANGELOG 里这一版的内容（tools/release-notes.js 抽出来，幂等）。
+      # 放在 release/ 之外：那个目录会被当成 Release 资产上传，别把正文也挂上去。
+      - name: Compose release body (说明 + CHANGELOG)
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -e
+          cat > body.md <<'EOF'
+          **塔科夫地图 ${{ steps.ver.outputs.version }}** — Windows 免安装单文件（portable / x64），双击即用。
+
+          下载：`tarkov-offline-map-${{ steps.ver.outputs.version }}-win-x64-portable.exe`（约 ${{ steps.art.outputs.size }}）
+          校验：`SHA256SUMS.txt`（同目录）
+
+          - 默认不联网：监听游戏日志自动识图 + 监听截图目录定位，运行时不发任何网络请求、无遥测
+          - 房间联机（v2.0 新增）为可选功能：需要你自己部署 `server/` 里的服务端并填写地址后才会连接
+            服务端两条路都行：上游 Docker 镜像 `docker run -d -p 8787:8787 ghcr.io/neppure/tarkov-offline-map-server:latest`
+            或者同一个 Release 里的 **Windows 单文件服务端** `tarkov-offline-map-server-*-win-x64.exe`（服务端有独立的版本号）
+            （双击即启动，窗口里会打印该填的服务器地址与端口；用法见 [server/README.md](https://github.com/C4mp0unLas/tarkov-offline-map/blob/main/server/README.md)）
+          - 全部离线内置：15 张地图中文数据、赛季文件刷点与位置参考截图、**5442 件物品与跳蚤价格（PVP / PVE 分开）**、
+            弹药 / 防具 / 钥匙、藏身处与制作 / 交换 / 倒卖、BOSS 与 BTR 路线、赛季特质，
+            以及 **546 个任务的中文说明、攻略与 1472 张攻略截图**
+          - 未做代码签名，SmartScreen 提示"未知发布者"时选择"仍要运行"
+          - 游戏需使用**无边框/窗口化**模式，悬浮小地图与图钉化地图才能显示在游戏画面之上
+          - 使用说明与原理见 [README](https://github.com/C4mp0unLas/tarkov-offline-map#readme)
+
+          更新内容见下方。
+          EOF
+          # CHANGELOG 里没有这一版就报错退出（宁可不发，也不要发一个没有更新内容的 Release）
+          node tools/release-notes.js --version "${{ steps.ver.outputs.version }}" --body body.md --out body.md
+          echo "----- 正文预览 -----"
+          head -n 24 body.md
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || steps.ver.outputs.tag }}
+          name: 塔科夫地图 ${{ steps.ver.outputs.version }}
+          files: release/*
+          body_path: body.md
+          # GitHub 会把 body_path 的内容拼在自动生成条目前面：模板 -> CHANGELOG -> 自动条目
+          generate_release_notes: true
+          fail_on_unmatched_files: true

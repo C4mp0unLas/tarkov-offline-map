@@ -1,0 +1,657 @@
+'use strict';
+
+/**
+ * 圆形小地图悬浮窗：跟随玩家 + 车头朝上 + 缩放
+ */
+import { MapView, metersToScreen, panCenterAfterDrag, normalizeMiniAnnoMode, filterAnnosForMini, isNewLocation } from './common/map-view.js';
+import { taskLocation, questsFingerprint } from './common/quest-filter.js';
+import { pruneRoomToOnline } from './common/room.js';
+
+const api = window.api;
+
+const view = new MapView(document.getElementById('mini-root'), { mini: true });
+window.__view = view; // 可视化自检 / CDP 验收用（与主窗口一致）
+let detail = null;
+let stateRevision = 0;
+let RADIUS_M = 55;
+let radiusDirty = false;     // 配置里的"显示半径"变了：下一次应用状态时按新半径重新铺满圆盘
+let miniFollowMainZoom = false;
+let miniRotate = false;      // 固定地图方向（默认）；true = 随角色朝向旋转
+let miniAutoCenter = true;   // 定位后自动居中到玩家
+let miniAutoFloor = true;    // 按玩家高度自动切换楼层层级
+let clickThrough = false;    // 点击穿透状态（来自配置）
+
+// 标注：我画的那份（annotations.json）也要画在雷达上；队友的那份来自房间快照。
+// 三档配置见设置里的"雷达上显示标注"（off / mine / all），另外两边都还受图例开关控制。
+let miniAnnosMode = 'all';
+let myAnnos = [];            // 当前地图上我画的笔画
+let myAnnosMapId = null;     // 上面这份属于哪张图
+let lastAnnosAt = null;      // 主进程广播的"标注变更时间戳"（变了才重取，不做每秒 IPC）
+
+// 任务点：和主窗口用**同一份** quests-dump.json + 同一份勾选状态（配置里的 quests.checked），
+// 所以主地图上画了什么，雷达上就有同样的东西（区域多边形 / 物品刷新点）。
+// 数据是 880KB 的静态文件，只在第一次需要时取一次；勾选状态没变就不重算图层。
+let questCfg = { checked: [], showKill: false };
+let questKey = null;         // 地图 + checked + showKill 的指纹（变了才重算图层）
+let questDump = null;
+let questLoading = null;
+const MAX_MINI_QUESTS = 40;  // 与主窗口一致（一张图同时画太多任务会糊成一片）
+
+// 地图 id -> 中文名（转移点文字要用：数据里 description 只写"前往"时靠它补目的地）
+let mapNames = null;
+
+// 雷达视野偏移（地图像素）：Ctrl 拖动圆盘 = 平移圆盘里的地图，而不是移动悬浮窗。
+// 偏移叠加在"跟随玩家居中"之上——玩家照旧跟随，只是不再固定在圆心（相当于往某侧多看一点）。
+// Ctrl + 双击 归零；换图（新一局）也会自动归零。
+const panOffset = { x: 0, y: 0 };
+// 最近一次「新定位」事件的 positionAt：主进程每处理一张新截图都会刷新它（坐标没变也会换）
+let lastPositionAt = null;
+
+// 赛季文件刷点（版本活动找东西）：离线快照，主窗口与小地图都标出来
+let seasonData = null;
+const seasonReady = (async () => {
+  try {
+    seasonData = await (await fetch('app://data/season-documents.json')).json();
+  } catch {
+    seasonData = null;
+  }
+})();
+
+async function getDetail(mapId) {
+  const json = await (await fetch('app://data/maps-dump.json')).json();
+  return json.maps.map((m) => m.detail).find((d) => d.id === mapId) || null;
+}
+
+/**
+ * 地图清单（主进程扫盘后经 listMaps 下发）：本地瓦片底图清单 + 地图中文名。
+ * 只取一次，之后换图/换标注直接查。
+ */
+let mapList = null;
+async function listMapsCached() {
+  if (mapList === null) {
+    try { mapList = await api.listMaps(); } catch { mapList = []; }
+  }
+  return mapList;
+}
+
+async function tileDirsFor(mapId) {
+  const m = (await listMapsCached()).find((x) => x.id === mapId);
+  return (m && m.tiles) || null;
+}
+
+/** 转移点文字要用"地图 id -> 中文名"（与主窗口同一份逻辑，否则雷达上只写"前往"） */
+async function mapNamesDictionary() {
+  if (mapNames) return mapNames;
+  mapNames = new Map();
+  for (const m of await listMapsCached()) {
+    if (m && m.id && m.name && !mapNames.has(m.id)) mapNames.set(m.id, m.name);
+  }
+  return mapNames;
+}
+
+/** 任务库（data/quests-dump.json）：只在第一次需要时取一次；失败允许下次重试 */
+function ensureQuestDump() {
+  if (questDump) return Promise.resolve(questDump);
+  if (questLoading) return questLoading;
+  questLoading = (async () => {
+    const dump = await (await fetch('app://data/quests-dump.json')).json();
+    questDump = dump;
+    return dump;
+  })();
+  questLoading.catch(() => { questLoading = null; });
+  return questLoading;
+}
+
+/**
+ * 主窗口勾选的任务 -> 雷达图层。
+ * 与 renderer/map.js#syncQuestLayer 同一套算法（同一份数据、同一份勾选），
+ * 这样"地图上看到的"和"雷达上看到的"永远一致。
+ */
+async function syncQuestLayer(mapId) {
+  const items = [];
+  try {
+    const dump = await ensureQuestDump();
+    // 谁勾了这个任务：'' = 我，其余是队友（房间共享的勾选）；同一个任务只画一次
+    const ownersOf = new Map();
+    const addOwner = (taskId, owner) => {
+      if (!taskId) return;
+      if (!ownersOf.has(taskId)) ownersOf.set(taskId, new Set());
+      ownersOf.get(taskId).add(owner);
+    };
+    for (const id of questCfg.checked) addOwner(id, '');
+    for (const [pid, ids] of Object.entries(questCfg.peerQuests || {})) {
+      if (!Array.isArray(ids)) continue;
+      for (const id of ids) addOwner(id, pid);
+    }
+    const traders = new Map((dump.traders || []).map((t) => [t.id, t]));
+    for (const task of dump.tasks || []) {
+      const owners = ownersOf.get(task.id);
+      if (!owners) continue;
+      const loc = taskLocation(task, mapId, { showKill: questCfg.showKill });
+      if (!loc.zones.length && !loc.spots.length) continue;
+      const tr = traders.get(task.trader);
+      const peers = [...owners].filter(Boolean);
+      items.push({
+        id: task.id,
+        label: `${task.name}${tr ? ` · ${tr.name}` : ''}`,
+        zones: loc.zones,
+        spots: loc.spots,
+        mine: owners.has(''),
+        peers,
+        ownersText: owners.has('') ? '我勾选的' : '队友勾选的',
+      });
+      if (items.length >= MAX_MINI_QUESTS) break;
+    }
+  } catch (e) {
+    console.warn('雷达读取任务数据失败（不影响使用）', e);
+  }
+  // 取数据期间又换图了：这份结果作废（否则会把上一张图的任务画到新图上）
+  if (detail && detail.id === mapId) view.setQuests(items);
+}
+
+/**
+ * 需要时才重算任务图层：换图、勾选状态/击杀区开关变了、或者队友的勾选变了。
+ * 状态推送很频繁（每次定位、拖动都会来一条），这里靠指纹挡住重复计算。
+ */
+async function maybeSyncQuests(mapId) {
+  const want = `${mapId}|${questCfg.checked.slice().sort().join(',')}|${questCfg.showKill ? 1 : 0}|${questsFingerprint(questCfg.peerQuests)}`;
+  if (want === questKey) return;
+  questKey = want; // 先记下：同一张图/同一份勾选的并发推送只算一次
+  await syncQuestLayer(mapId);
+}
+
+/** 以 (x,z) 为中心时，让半径 RADIUS_M 正好铺满圆盘的缩放（小地图的"标准视野"） */
+function radiusScale(x, z) {
+  const w = document.getElementById('mini-root').getBoundingClientRect().width || 296;
+  // RADIUS_M 米在 scale=1 时的屏幕像素 -> 让它等于圆盘半径(w/2)
+  const dist = Math.max(metersToScreen(view.proj, x, z, RADIUS_M), 1e-6);
+  return Math.min(60, Math.max(0.01, (w / 2) / dist));
+}
+
+function centerOnPlayer(zoomToRadius = false) {
+  if (!view.player || !detail) return;
+  const p = view.proj.project(view.player.x, view.player.z);
+  view.view.cx = p.x + panOffset.x;
+  view.view.cy = p.y + panOffset.y;
+  if (zoomToRadius) view.view.scale = radiusScale(view.player.x, view.player.z);
+  // 固定地图方向（默认）：rot 恒为 0；开启"随朝向旋转"才按朝向转
+  if (miniRotate && view.heading) {
+    view.view.rot = ((view.heading.screenAngleDeg + 90) * Math.PI) / 180;
+  } else {
+    view.view.rot = 0;
+  }
+  view.setViewport({ cx: view.view.cx, cy: view.view.cy, scale: view.view.scale, rot: view.view.rot });
+}
+
+/**
+ * 视野中心不动，只按"固定地图方向 / 随角色朝向旋转"重画一遍。
+ * 关掉「定位后自动居中」时用它：玩家点跟着更新，但视野不跳。
+ */
+function applyMiniRotation() {
+  view.view.rot = miniRotate && view.heading ? ((view.heading.screenAngleDeg + 90) * Math.PI) / 180 : 0;
+  view.setViewport({ cx: view.view.cx, cy: view.view.cy, scale: view.view.scale, rot: view.view.rot });
+}
+
+/**
+ * 只把缩放重算成"配置的显示半径正好铺满圆盘"，视野中心不动。
+ * 改「显示半径(米)」或改「雷达窗口大小」时都要走一遍 —— 否则同一个 scale 下
+ * 窗口越大看到的地方越多，设置里写的 55 米就不是 55 米了。
+ */
+function refitRadius() {
+  if (!view.player || !detail || !view.proj) { centerOnMap(); return; }
+  view.view.scale = radiusScale(view.player.x, view.player.z);
+  view.setViewport({ cx: view.view.cx, cy: view.view.cy, scale: view.view.scale, rot: view.view.rot });
+}
+
+/**
+ * 还没有玩家位置时（截图定位前）：以地图中心按"标准视野"显示，
+ * 而不是缩到整张图——否则上千个标记会挤成一团浆糊（大图标下尤其明显）。
+ */
+function centerOnMap() {
+  if (!detail || !view.proj) return;
+  const px = view.getMapPixelBounds();
+  const cx = px.minX + px.width / 2, cy = px.minY + px.height / 2;
+  const w = view.proj.unproject(cx, cy);
+  view.view.cx = cx;
+  view.view.cy = cy;
+  view.view.scale = radiusScale(w.x, w.z);
+  view.view.rot = 0;
+  view.setViewport({ cx: view.view.cx, cy: view.view.cy, scale: view.view.scale, rot: 0 });
+}
+
+function applyBossMonitor(snapshot) {
+  const status = document.getElementById('mini-boss-status');
+  const local = !!snapshot && snapshot.mode === 'local-pve';
+  const recognizing = !!snapshot && snapshot.mode === 'recognizing';
+  view.setBossMarkers(local ? snapshot.markers : []);
+  if (!status) return;
+  status.classList.toggle('hidden', !local && !recognizing);
+  status.textContent = local ? '首领监控 · 本地 PvE' : recognizing ? '战局模式识别中' : '';
+}
+
+async function applyState(s) {
+  if (!s) return;
+  const revision = ++stateRevision;
+  applyBossMonitor(s.bossMonitor);
+  if (!s.mapId) return;
+  // 队友已经退出房间 -> 他共享的标注/勾选也不该留在雷达上（服务端会保留他的数据，
+  // 但"画不画"要按此刻在不在房间里算；他回来时同一份数据立刻又能画出来）
+  const room = pruneRoomToOnline(s.room);
+  // 配置先落地（RADIUS_M 影响标准视野的缩放）
+  if (s.config) {
+    view.setMarkerToggles(s.config.markerToggles);
+    // 图例大类里"关掉文字"的：雷达上这一类只留图标（与主窗口共用同一份开关）
+    view.setLabelToggles(s.config.labelToggles);
+    // "表层显示全部标记"与主窗口一致：关掉后雷达也只画当前楼层的标记
+    view.setShowAllHeights(s.config.showAllMarkers !== false);
+    view.setMarkerScale(s.config.markerScale || 1);
+    view.setLabelScale(s.config.labelScale || 1);
+    miniFollowMainZoom = !!s.config.miniFollowMainZoom;
+    miniAutoFloor = s.config.miniAutoFloor !== false;
+    miniAnnosMode = normalizeMiniAnnoMode(s.config.miniAnnos);
+    // 任务点：同一份勾选状态 + 同一套透明度（主地图上什么样，雷达上就什么样）
+    const q = s.config.quests || {};
+    questCfg = {
+      checked: Array.isArray(q.checked) ? q.checked : [],
+      showKill: !!q.showKill,
+      peerQuests: (room && room.quests) || {},
+    };
+    view.setQuestOpacity(q.opacity ?? 0.25);
+    api.setMiniOpacity(s.config.miniOpacity ?? 0.9);
+    setClickThrough(!!s.config.miniClickThrough);
+    // 「显示半径(米)」在设置页里是即时生效的：半径变了要按新半径重新铺满圆盘，
+    // 否则拖完滑块得等到下一次定位才看得出来（而且窗口越大看得越多，数字就不准了）
+    const nextRadius = Number(s.config.miniRadius) || 55;
+    if (Math.abs(nextRadius - RADIUS_M) > 0.01) radiusDirty = true;
+    RADIUS_M = nextRadius;
+    miniAutoCenter = s.config.miniAutoCenter !== false;
+    // 「随角色朝向旋转」也即时生效：勾上/去掉立刻按新角度重画，不用等下一次定位
+    const nextRotate = !!s.config.miniRotate;
+    if (nextRotate !== miniRotate && view.player) {
+      miniRotate = nextRotate;
+      view.rotate = miniRotate;
+      if (miniAutoCenter) {
+        centerOnPlayer(false);
+      } else {
+        // 自动居中关着：只按新角度重画，视野中心不动
+        applyMiniRotation();
+      }
+    }
+    miniRotate = nextRotate;                         // 默认 false = 固定地图方向
+  }
+  if (!detail || detail.id !== s.mapId) {
+    const nextDetail = await getDetail(s.mapId);
+    if (revision !== stateRevision || !nextDetail) return;
+    detail = nextDetail;
+    panOffset.x = 0; // 换图（新一局）：上一张图的偏移没有意义，回到居中
+    panOffset.y = 0;
+    let svgText = null;
+    if (detail.svgPath) {
+      const file = detail.svgPath.split('/').pop();
+      try { svgText = await (await fetch(`app://data/maps/${file}`)).text(); } catch {}
+    }
+    await view.setMap(detail, svgText, { tileDirs: await tileDirsFor(s.mapId) });
+    if (revision !== stateRevision) return;
+    // 转移点文字要用中文目的地（不然雷达上只剩"前往"两个字）
+    view.setMapNames(await mapNamesDictionary());
+    // 赛季文件刷点（离线快照）：小地图上也标出来，找文件时不用切回主窗口
+    await seasonReady;
+    if (seasonData) view.setSeasonDocuments(seasonData, detail.id);
+    // 还没定位过 -> 先给一个标准视野（地图中心 + 半径尺度），避免整图缩略时的标记糊成一团
+    if (!view.player) centerOnMap();
+  }
+  // 勾选的任务点：换图或勾选变了才重算（与主窗口画的是同一批）
+  await maybeSyncQuests(detail.id);
+  if (revision !== stateRevision) return;
+  if (s.position && s.quaternion) {
+    view.rotate = miniRotate;
+    const prev = view.player;
+    const wasNull = !prev;
+    // 小地图的"居中/旋转"统一由这里决定：map-view 内部的 follow 会在 setPlayer 里
+    // **无视视野偏移**强行把玩家拉到圆心，那会把"定位后自动居中 = 关"这个开关架空
+    // （关了也照样每次都跳回玩家）。所以雷达里一律不靠它。
+    view.follow = false;
+    view.setPlayer(s.position, s.quaternion);
+    view.setTrail(s.trail);
+    // 新的一次定位 -> 回到"玩家在圆心"：把 Ctrl 拖动平移出来的视野偏移归零。
+    // 踩过的坑：偏移会一直留着，于是"拖动雷达之后再按截图键定位，玩家停在偏心位置不回中"
+    // （用户报的第 1 条）。平移只是临时往旁边看两眼，新的一次定位理应重新居中。
+    //
+    // 「新的一次定位」以主进程的 positionAt 为准：每处理一张新截图都会刷新它，
+    // 所以**站着没动、原地再按一次截图键**（坐标一模一样）也算，照样回中。
+    // 拖动窗口 / 切图例 / 改设置推的是同一份 positionAt，不会把刚平移出来的视野拉回去。
+    const nextPosAt = (s.positionAt != null && Number.isFinite(Number(s.positionAt))) ? Number(s.positionAt) : null;
+    if (isNewLocation(lastPositionAt, nextPosAt, prev, view.player, miniAutoCenter)) {
+      if (panOffset.x || panOffset.y) api.miniProbe({ ev: 'pan-reset-position' });
+      panOffset.x = 0;
+      panOffset.y = 0;
+    }
+    if (nextPosAt != null) lastPositionAt = nextPosAt;
+    // 自动居中：关掉后只更新玩家点/轨迹，不再把视野拉回玩家（配合手动缩放查看周边）
+    if (miniAutoCenter || wasNull) {
+      centerOnPlayer(wasNull || radiusDirty);
+    } else {
+      if (radiusDirty) refitRadius();
+      applyMiniRotation(); // 视野不动，但"随朝向旋转"仍要跟着转
+    }
+    radiusDirty = false;
+  } else if (view.player) {
+    // 新一局（进图日志已清空位置）：抹掉上一局的玩家点与轨迹，视野回退到"还没定位"的状态
+    view.clearPlayer();
+    panOffset.x = 0;
+    panOffset.y = 0;
+    lastPositionAt = null; // 下一张截图会是新一轮"第一次定位"
+    radiusDirty = false;
+    centerOnMap();
+  } else if (radiusDirty) {
+    // 还没定位过：半径改了也要立刻反映到"地图中心的标准视野"上
+    radiusDirty = false;
+    centerOnMap();
+  }
+  // 楼层：默认按玩家高度自动切层；关掉后固定在地图基础层
+  // （基础层用 view.baseLayer：SVG 图是 detail.svgLayer，瓦片图是它的第一层）
+  if (miniAutoFloor) view.setFloor('auto');
+  else view.setFloor(view.baseLayer || (detail && detail.svgLayer) || 'auto');
+  // 房间成员：雷达上也画队友（离得近的时候比主窗口更有用）
+  const myId = room && room.self ? room.self.id : null;
+  const peerAnnos = room && Array.isArray((room.annos || {})[detail.id])
+    ? room.annos[detail.id].filter((a) => a && a.owner !== myId)
+    : [];
+  if (room) view.setPeers(Array.isArray(room.peers) ? room.peers : []);
+  else view.setPeers([]);
+
+  // 标注（我画的 + 队友的）：换图或"主进程说标注变了"时重取一次
+  const annosChanged = s.annosAt != null && s.annosAt !== lastAnnosAt;
+  if (myAnnosMapId !== detail.id || annosChanged) {
+    if (s.annosAt != null) lastAnnosAt = s.annosAt;
+    const wantMap = detail.id;
+    try {
+      const all = await api.getAnnotations();
+      // 换图/重取期间又切了图：这份结果作废（否则会把上一张图的笔画画到新图上）
+      if (detail && detail.id === wantMap) {
+        myAnnos = (all && all[wantMap]) || [];
+        myAnnosMapId = wantMap;
+      }
+    } catch (e) {
+      console.warn('雷达读取标注失败（不影响使用）', e);
+    }
+  }
+  const split = filterAnnosForMini(miniAnnosMode, myAnnos, peerAnnos);
+  view.setAnnotations(split.mine);
+  view.setPeerAnnos(split.peers);
+}
+
+api.onState((s) => applyState(s));
+api.getState().then((s) => applyState(s));
+
+/**
+ * 窗口大小变了（设置里的「雷达窗口大小」）：
+ * 圆盘变大/变小后，配置里的「显示半径(米)」要重新铺满圆盘 —— 否则同一个缩放比例下
+ * 窗口越大看到的地方越多，设置里写的 55 米就不再是 55 米了。
+ * 顺手把右下角"锁/解锁"小块的位置也重报一次（它按窗口尺寸定位）。
+ */
+let lastDiscW = 0;
+function syncDiscSize() {
+  const w = document.getElementById('mini-root').getBoundingClientRect().width;
+  if (!w || Math.abs(w - lastDiscW) < 0.5) return;
+  const first = lastDiscW === 0;
+  lastDiscW = w;
+  requestAnimationFrame(reportLockBarRect);
+  if (first) return; // 启动时的那一次：只记尺寸，不动视野
+  if (!detail || !view.proj) return;
+  if (!view.player) { centerOnMap(); return; }
+  refitRadius();
+  if (miniAutoCenter) centerOnPlayer(false);
+}
+window.addEventListener('resize', () => requestAnimationFrame(syncDiscSize));
+requestAnimationFrame(syncDiscSize); // 启动时先记下圆盘尺寸（不重算视野）
+
+// 可视化自检 / CDP 验收用（和主窗口的 window.__view 一个用途）：
+// 雷达的尺寸、显示半径、视野偏移都能读，验收脚本据此断言"定位后玩家在圆心"。
+window.__mini = {
+  discWidth: () => document.getElementById('mini-root').getBoundingClientRect().width,
+  radiusM: () => RADIUS_M,
+  autoCenter: () => miniAutoCenter,
+  rotate: () => miniRotate,
+  pan: () => ({ x: panOffset.x, y: panOffset.y }),
+  setPan: (x, y) => { panOffset.x = Number(x) || 0; panOffset.y = Number(y) || 0; centerOnPlayer(false); },
+  viewport: () => view.getViewport(),
+  player: () => view.player,
+};
+
+
+// 小地图忽略主窗口的平移；仅在"缩放跟随互动地图"开启时同步缩放（默认按自身半径）
+api.onViewportSync((vp) => {
+  if (!view.player) return;
+  // 「定位后自动居中」关着时，这条同步路径也不许把视野拉回玩家 —— 否则主窗口每次定位
+  // 都会发一次 viewport 同步，雷达跟着跳一下，开关等于被架空（用户报的第 1 条）。
+  if (!miniAutoCenter) {
+    // 只跟随缩放，视野中心一格不挪；旋转仍按当前设置
+    if (miniFollowMainZoom) { view.view.scale = vp.scale; applyMiniRotation(); }
+    return;
+  }
+  if (miniFollowMainZoom) view.view.scale = vp.scale;
+  centerOnPlayer(false);
+});
+
+// ---------------------------------------------------------------------------
+// 窗口拖动：圆盘任意位置按下即可拖动悬浮窗位置
+// 真正的移动在主进程完成（按真实光标位置 setBounds），所以指针移出小窗口
+// 甚至移出屏幕都不会中断拖动；松手后位置会记忆到配置里。
+// Ctrl + 拖动 = 拖动圆盘里面的地图（平移视野），窗口不动，见下面 beginMapPan。
+// ---------------------------------------------------------------------------
+let windowDragging = false;
+let mapPanning = false;
+let panPointerId = null;
+let panStart = null; // {x, y, ox, oy, rot, scale}
+
+function beginWindowDrag() {
+  if (windowDragging) return;
+  if (mapPanning) endMapPan(); // 两种手势互斥，别让上一次残留状态串味
+  windowDragging = true;
+  document.body.classList.add('dragging');
+  api.miniDragStart();
+}
+
+function endWindowDrag() {
+  if (!windowDragging) return;
+  windowDragging = false;
+  document.body.classList.remove('dragging');
+  api.miniDragEnd();
+}
+
+/** Ctrl + 按下：开始平移"圆盘里的地图"（窗口本身不动） */
+function beginMapPan(e) {
+  if (mapPanning) return;
+  if (windowDragging) endWindowDrag(); // 两种手势互斥
+  mapPanning = true;
+  panPointerId = e.pointerId;
+  panStart = {
+    x: e.clientX, y: e.clientY,
+    cx: view.view.cx, cy: view.view.cy, // 记的是"当前视野中心"，两种居中模式下都对
+    // 拖动过程中朝向可能变（随朝向旋转模式），按"按下那一刻"的角度换算，手感才稳
+    rot: view.view.rot || 0,
+    scale: view.view.scale || 1,
+  };
+  panBase = null;
+  panMoved = false;
+  document.body.classList.add('panning');
+  api.miniPing();
+  api.miniProbe({ ev: 'pan-begin', ctrl: e.ctrlKey, meta: e.metaKey, scale: panStart.scale, rot: panStart.rot });
+  // 位置由主进程轮询真实光标后推送（见 main.js startMiniPan）：
+  // 透明窗口上 setPointerCapture 不可靠，光标一离开 300px 圆盘事件就断，表现为"地图只动一点点"
+  api.miniPanStart().then((base) => { panBase = base || null; }).catch(() => {});
+}
+
+/**
+ * 把视野中心挪到 (cx,cy) 并同步"相对玩家的偏移"。
+ * 自动居中开着时，偏移量保证玩家照旧跟随（只是不再固定在圆心）；
+ * 自动居中关掉时，这就是一次普通的平移，视野不会被拉回去。
+ */
+function panToCenter(cx, cy) {
+  if (view.player && detail) {
+    const p = view.proj.project(view.player.x, view.player.z);
+    panOffset.x = cx - p.x;
+    panOffset.y = cy - p.y;
+  }
+  view.setViewport({ cx, cy, scale: view.view.scale, rot: view.view.rot });
+}
+
+// 主进程 12ms 轮询推送的真实光标位置（DIP，绝对坐标）：Delta 相对按下时的基准点算，
+// 所以中途漏掉几条消息也不会累积误差
+api.onMiniPan((p) => {
+  if (!mapPanning || !panStart || !panBase || !p) return;
+  const dx = p.x - panBase.x, dy = p.y - panBase.y;
+  if (!panMoved) { panMoved = true; api.miniProbe({ ev: 'pan-move', dx, dy }); }
+  pendingCenter = panCenterAfterDrag(panStart.cx, panStart.cy, panStart.scale, panStart.rot, dx, dy);
+  scheduleCenter();
+});
+
+/** 平移/缩放这类高频路径统一走 rAF，避免每个更新都重建一遍标记 */
+let centerRaf = 0;
+let pendingCenter = null;
+let panBase = null;   // 按下时主进程给的光标基准点
+let panMoved = false; // 这一次平移是否真的动过（诊断用）
+function scheduleCenter() {
+  if (centerRaf) return;
+  centerRaf = requestAnimationFrame(() => {
+    centerRaf = 0;
+    const c = pendingCenter;
+    pendingCenter = null;
+    if (c) panToCenter(c.cx, c.cy);
+    else if (view.player) centerOnPlayer(false);
+  });
+}
+
+function endMapPan(e) {
+  // 不再按 pointerId 过滤：移动改由主进程推送，这里只要"松手/失焦"就收尾，
+  // 免得因为 pointerId 对不上而卡在平移状态
+  if (!mapPanning) return;
+  mapPanning = false;
+  panPointerId = null;
+  panBase = null;
+  document.body.classList.remove('panning');
+  api.miniPanEnd();
+  api.miniProbe({ ev: 'pan-end', moved: panMoved });
+  panMoved = false;
+  if (e && e.pointerId != null) { try { document.getElementById('mini-root').releasePointerCapture(e.pointerId); } catch {} }
+}
+
+/** 视野偏移归零（Ctrl + 双击） */
+function resetPanOffset() {
+  panOffset.x = 0;
+  panOffset.y = 0;
+  pendingCenter = null;
+  api.miniProbe({ ev: 'pan-reset' });
+  if (view.player) centerOnPlayer(false);
+  else centerOnMap();
+}
+
+document.body.addEventListener('pointerdown', (e) => {
+  if (e.button !== 0) return;
+  // 右下角"锁 / 解锁"小条照旧可点；点击穿透状态下不接管鼠标
+  if (e.target instanceof Element && e.target.closest('#mini-lockbar')) return;
+  if (clickThrough) return;
+  e.preventDefault();
+  api.miniPing();
+  // 诊断（写进 userData/mini.log）：渲染层看到的 ctrlKey vs Windows 的真实按键状态。
+  // 实测雷达窗口（focusable:false，键盘焦点在游戏）里 ctrlKey 可能是 false，
+  // 所以判定一律以"系统真实状态"为准，ctrlKey 只当快速路径。
+  const localCtrl = !!(e.ctrlKey || e.metaKey);
+  api.miniProbe({ ev: 'down', ctrl: e.ctrlKey, meta: e.metaKey, button: e.button, type: e.pointerType });
+
+  const press = (isCtrl) => {
+    if (isCtrl) {
+      // Ctrl + 双击：视野偏移归零。
+      // 注意不能靠 dblclick 事件：pointerdown 里 preventDefault 之后 Chromium 不再派发
+      // 兼容鼠标事件（mousedown/click/dblclick），所以这里自己按"两次按下"判定。
+      const now = performance.now();
+      const isDouble = ctrlDown && now - ctrlDown.t < 450 && Math.hypot(e.clientX - ctrlDown.x, e.clientY - ctrlDown.y) < 8;
+      ctrlDown = isDouble ? null : { t: now, x: e.clientX, y: e.clientY };
+      if (isDouble) { resetPanOffset(); return; }
+      beginMapPan(e);
+    } else {
+      ctrlDown = null;
+      beginWindowDrag();
+    }
+  };
+
+  if (localCtrl) { press(true); return; }
+  // 渲染层没看到 Ctrl：向主进程确认真实按键状态（常驻助手，毫秒级）再决定，
+  // 这样即使 ctrlKey 投递丢了，"按住 Ctrl 拖" 依旧能生效
+  const seq = ++pressSeq;
+  api.miniCtrlState()
+    .then((real) => { if (seq === pressSeq) press(real === true); })
+    .catch(() => { if (seq === pressSeq) press(false); });
+});
+let ctrlDown = null; // {t, x, y} 上一次 Ctrl 按下的位置（自己判定双击）
+let pressSeq = 0;    // 松手会让未决的"这次按下"作废（点击比确认还快的情况）
+// 保险：万一某个 Chromium 版本仍然派发 dblclick，这里做同样的归零（幂等）
+document.body.addEventListener('dblclick', (e) => {
+  if (e.target instanceof Element && e.target.closest('#mini-lockbar')) return;
+  if (clickThrough) return;
+  if (!(e.ctrlKey || e.metaKey)) return;
+  e.preventDefault();
+  resetPanOffset();
+});
+// 松手/失焦：两边都必须收尾。
+// 坑（踩过）：这里曾经只留了 endMapPan，漏掉 endWindowDrag —— 结果按一下之后
+// 主进程的窗口拖动会一直跑到 15 秒超时才停，雷达跟着鼠标乱飘，后续操作全乱。
+window.addEventListener('pointerup', (e) => { pressSeq++; endMapPan(e); endWindowDrag(); });
+window.addEventListener('pointercancel', (e) => { pressSeq++; endMapPan(e); endWindowDrag(); });
+window.addEventListener('blur', () => { pressSeq++; endMapPan(); endWindowDrag(); });
+
+// 透明悬浮窗被点击/悬停后偶发停止重绘：让主进程刷新一次
+document.body.addEventListener('pointerenter', () => api.miniPing());
+
+// 键盘兜底：小地图窗口永远不响应 Tab/空格/回车
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Tab' || e.key === ' ' || e.key === 'Enter') e.preventDefault();
+}, true);
+
+// ---------------------------------------------------------------------------
+// 点击穿透（"能看到点不着"）+ 右下角"靠近才出现"的 锁 / 解锁 小按钮
+//
+// 未锁定：窗口正常接收鼠标，悬停就显示「锁」，点它开启穿透。
+// 已锁定：窗口穿透，渲染层收不到鼠标移动（实测 Windows 上 forward:true 也不会
+//   把真实鼠标移动转给渲染层），所以由主进程按光标轮询这个小条的位置判定"靠近"，
+//   靠近时临时恢复交互并通知渲染层把「解锁」显示出来，点它就关掉穿透。
+// ---------------------------------------------------------------------------
+const lockBar = document.getElementById('mini-lockbar');
+const lockBtn = document.getElementById('mini-lock');
+const unlockBtn = document.getElementById('mini-unlock');
+
+function reportLockBarRect() {
+  const r = lockBar.getBoundingClientRect();
+  if (r.width > 0) api.miniUnlockRect({ x: r.left, y: r.top, w: r.width, h: r.height });
+}
+
+function setClickThrough(on) {
+  if (clickThrough === on) return;
+  clickThrough = on;
+  document.body.classList.toggle('locked', on);
+  requestAnimationFrame(reportLockBarRect);
+}
+
+// 主进程判定"光标放在雷达上 / 正好在小条上"后通知：
+//   near  -> 把「锁 / 解锁」显示出来（锁定时靠它，未锁定时用 CSS hover）
+//   onBar -> 只在这一小块上临时恢复交互，其余区域仍然穿透（点不着）
+api.onLockHot((state) => {
+  const hot = typeof state === 'object' && state ? state : { near: !!state, onBar: !!state };
+  document.body.classList.toggle('hot', !!hot.near);
+  document.body.classList.toggle('bar-live', !!hot.onBar);
+});
+
+lockBtn.addEventListener('click', (e) => {
+  e.preventDefault();
+  lockBtn.blur();
+  api.miniClickThrough(true); // 锁定：开启点击穿透
+});
+
+unlockBtn.addEventListener('click', (e) => {
+  e.preventDefault();
+  unlockBtn.blur();
+  api.miniClickThrough(false); // 解锁：关闭点击穿透
+});
+
+window.addEventListener('load', () => requestAnimationFrame(reportLockBarRect));

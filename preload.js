@@ -1,0 +1,71 @@
+'use strict';
+
+const { contextBridge, ipcRenderer } = require('electron');
+
+contextBridge.exposeInMainWorld('api', {
+  getState: () => ipcRenderer.invoke('state:get'),
+  onState: (cb) => {
+    const h = (_e, state) => cb(state);
+    ipcRenderer.on('state', h);
+    return () => ipcRenderer.removeListener('state', h);
+  },
+  getConfig: () => ipcRenderer.invoke('config:get'),
+  setConfig: (patch) => ipcRenderer.invoke('config:set', patch),
+  listMaps: () => ipcRenderer.invoke('map:list'),
+  selectMap: (sel) => ipcRenderer.invoke('map:select', sel),
+  setFloor: (floor) => ipcRenderer.invoke('floor:set', floor),
+  toggleMini: () => ipcRenderer.invoke('mini:toggle'),
+  ensureMini: () => ipcRenderer.invoke('mini:ensure'),
+  setMiniOpacity: (o) => ipcRenderer.invoke('mini:opacity', o),
+  miniDragStart: () => ipcRenderer.invoke('mini:drag-start'),
+  miniDragEnd: () => ipcRenderer.invoke('mini:drag-end'),
+  // Ctrl + 拖动：平移圆盘里的地图。位置由主进程轮询真实光标后推送（透明窗口上
+  // pointermove/指针捕获不可靠，光标一离开圆盘就断）
+  miniPanStart: () => ipcRenderer.invoke('mini:pan-start'),
+  miniPanEnd: () => ipcRenderer.invoke('mini:pan-end'),
+  onMiniPan: (cb) => {
+    const h = (_e, p) => cb(p);
+    ipcRenderer.on('mini:pan', h);
+    return () => ipcRenderer.removeListener('mini:pan', h);
+  },
+  miniProbe: (msg) => ipcRenderer.invoke('mini:probe', msg),
+  miniCtrlState: () => ipcRenderer.invoke('mini:ctrl-state'),
+  miniStatus: () => ipcRenderer.invoke('mini:status'),
+  miniClickThrough: (on) => ipcRenderer.invoke('mini:click-through', on),
+  miniUnlockRect: (rect) => ipcRenderer.send('mini:unlock-rect', rect),
+  onLockHot: (cb) => {
+    const h = (_e, hot) => cb(hot);
+    ipcRenderer.on('mini:lock-hot', h);
+    return () => ipcRenderer.removeListener('mini:lock-hot', h);
+  },
+  miniPing: () => ipcRenderer.invoke('mini:ping'),
+  resizeMini: (scale) => ipcRenderer.send('mini:resize', scale),
+  pickScreenshot: () => ipcRenderer.invoke('util:pick-screenshot'),
+  // 设置页的目录：选择文件夹（返回 {path} 或 null）/ 在资源管理器里打开
+  pickFolder: (opts) => ipcRenderer.invoke('util:pick-folder', opts),
+  openPath: (p) => ipcRenderer.invoke('util:open-path', p),
+  openExternal: (url) => ipcRenderer.invoke('util:open-external', url),
+  // 手动标注（世界坐标，按地图分开存）
+  getAnnotations: () => ipcRenderer.invoke('annotations:get'),
+  setAnnotations: (data) => ipcRenderer.invoke('annotations:set', data),
+  syncViewport: (viewport) => ipcRenderer.invoke('view:sync', viewport),
+  onViewportSync: (cb) => {
+    const h = (_e, v) => cb(v);
+    ipcRenderer.on('viewport:sync', h);
+    return () => ipcRenderer.removeListener('viewport:sync', h);
+  },
+  getStateForMini: () => ipcRenderer.invoke('state:sync-mini'),
+  // 资料库窗口（物品/价格/弹药/藏身处/制作/交换/BOSS…）：tab/id 用来直接跳转
+  openLibrary: (opts) => ipcRenderer.invoke('library:open', opts),
+  onLibraryGoto: (cb) => {
+    const h = (_e, o) => cb(o);
+    ipcRenderer.on('library:goto', h);
+    return () => ipcRenderer.removeListener('library:goto', h);
+  },
+  // 房间联机（v2.0，默认关）
+  roomTest: (cfg) => ipcRenderer.invoke('room:test', cfg),
+  roomStatus: () => ipcRenderer.invoke('room:status'),
+  roomReconnect: () => ipcRenderer.invoke('room:reconnect'),
+  roomLeave: () => ipcRenderer.invoke('room:leave'),
+  roomAnno: (msg) => ipcRenderer.invoke('room:anno', msg),
+});

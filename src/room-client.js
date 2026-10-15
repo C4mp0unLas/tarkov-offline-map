@@ -1,0 +1,812 @@
+'use strict';
+
+/**
+ * 房间客户端（主进程持有）。
+ *
+ * 为什么放在主进程而不是渲染进程：
+ *   - 有两个窗口（主地图 + 圆形小地图）都要用同一份房间数据，主进程是天然的唯一真源；
+ *   - 渲染进程重载（比如切图/刷新）不会把连接抖掉；
+ *   - 将来要换成自签 TLS 或者走代理，也不用碰渲染层的 CSP。
+ *
+ * 这个模块是纯 Node 的（只用 ws + node:http），不 require electron —— 所以单测里可以
+ * 直接起一个真服务端、连两个真客户端跑完整流程，不需要开界面。
+ *
+ * 房间号在这里推导（src/room-key.js），服务端只见到哈希。
+ */
+const http = require('http');
+const https = require('https');
+const { roomKey } = require('./room-key');
+const P = require('../server/protocol');
+
+const PROTO = P.PROTO;
+const DEFAULT_PORT = 8787;
+const POS_MIN_INTERVAL_MS = 200;   // 位置消息最小间隔（和服务端限速一致）
+const PING_INTERVAL_MS = 25000;    // 应用层心跳
+const PONG_TIMEOUT_MS = 10000;     // 心跳没回就判定连接已死
+const HANDSHAKE_TIMEOUT_MS = 8000; // TCP 通了但服务端迟迟不回 welcome：到这个点就掐掉重连
+const MAX_BACKOFF_MS = 30000;
+
+/** 指数退避：1s, 2s, 4s, 8s, 16s, 30s, 30s… */
+function backoffDelay(attempt) {
+  const n = Math.max(0, Math.min(20, Math.floor(attempt) || 0));
+  return Math.min(MAX_BACKOFF_MS, 1000 * 2 ** n);
+}
+
+/** 端口一律夹到合法范围：设置页里手打 -1 / 0 / 70000 时不能拼出 ws://host:-1/ws 这种废 URL */
+function clampPort(v, def = DEFAULT_PORT) {
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 1 || n > 65535) return def;
+  return n;
+}
+
+/**
+ * 把用户填的地址归一化成连接信息。
+ * 允许的写法： `192.168.1.10` / `192.168.1.10:9000` / `ws://host:8787/ws` /
+ *             `wss://room.example.com` / `http://host:8787`
+ * 返回 null 表示没填。
+ */
+function parseServer(input, defaultPort = DEFAULT_PORT) {
+  const raw = String(input == null ? '' : input).trim();
+  if (!raw) return null;
+  let secure = false;
+  let rest = raw;
+  const m = /^(wss?|https?):\/\//i.exec(raw);
+  if (m) {
+    secure = /^(wss|https)$/i.test(m[1]);
+    rest = raw.slice(m[0].length);
+  }
+  rest = rest.replace(/\/+$/, '');
+  rest = rest.replace(/\/ws$/i, '');
+  rest = rest.split('/')[0].trim(); // 只取 host[:port]：服务端固定挂在 /ws 上，路径不带
+  if (!rest) return null;
+  let host = rest;
+  let port = clampPort(defaultPort);
+  // 端口 = 最后一个冒号后面那段，但**IPv6 的方括号里的冒号不算**：
+  //   [::1]:8787 里的最后一个冒号在 ] 之后 -> 是端口分隔符
+  //   [fe80::1]  里的最后一个冒号在 ] 之前 -> 不是，用默认端口
+  const c = rest.lastIndexOf(':');
+  const bracketEnd = rest.indexOf(']');
+  if (c > 0 && (bracketEnd === -1 || bracketEnd < c)) {
+    const maybePort = rest.slice(c + 1);
+    if (/^\d{1,5}$/.test(maybePort)) {
+      const n = Number(maybePort);
+      if (n >= 1 && n <= 65535) {
+        port = n;
+        host = rest.slice(0, c);
+      }
+    }
+  }
+  if (!host) return null;
+  const scheme = secure ? 'wss' : 'ws';
+  const httpScheme = secure ? 'https' : 'http';
+  return {
+    host,
+    port,
+    secure,
+    wsUrl: `${scheme}://${host}:${port}/ws`,
+    healthUrl: `${httpScheme}://${host}:${port}/healthz`,
+  };
+}
+
+/** 探活：GET /healthz，给设置页的「测试连接」用 */
+function probeServer(input, defaultPort = DEFAULT_PORT, timeoutMs = 4000) {
+  return new Promise((resolve) => {
+    const info = parseServer(input, defaultPort);
+    if (!info) return resolve({ ok: false, error: '没填服务器地址' });
+    const mod = info.secure ? https : http;
+    const req = mod.get(info.healthUrl, { timeout: timeoutMs, headers: { connection: 'close' } }, (res) => {
+      let data = '';
+      res.setEncoding('utf8');
+      res.on('data', (c) => {
+        data += c;
+      });
+      res.on('end', () => {
+        if (res.statusCode !== 200) return resolve({ ok: false, error: `服务端返回 ${res.statusCode}`, server: info });
+        let body = null;
+        try {
+          body = JSON.parse(data);
+        } catch {
+          return resolve({ ok: false, error: '服务端返回的不是 JSON', server: info });
+        }
+        if (!body || body.ok !== true) return resolve({ ok: false, error: '服务端健康检查未通过', server: info });
+        const protoOk = Number(body.proto) === PROTO;
+        resolve({
+          ok: true,
+          protoOk,
+          ver: body.ver || null,
+          proto: body.proto || null,
+          maxRoomPeers: body.maxRoomPeers || null,
+          persist: !!body.persist,
+          server: info,
+          error: protoOk ? null : `协议不匹配：服务端 v${body.proto}，客户端 v${PROTO}`,
+        });
+      });
+    });
+    req.on('timeout', () => {
+      req.destroy();
+      resolve({ ok: false, error: `连接超时（${timeoutMs}ms）`, server: info });
+    });
+    req.on('error', (e) => resolve({ ok: false, error: e.message || String(e), server: info }));
+  });
+}
+
+const EMPTY_STATE = () => ({
+  enabled: false,
+  status: 'off',      // off | connecting | online | reconnecting | error
+  error: null,
+  server: null,       // {host, port, secure}
+  self: null,         // {id, nick}
+  peers: [],          // [{id, nick, map, pos, at}]
+  annos: {},          // mapId -> [笔画]（房间里已知的共享标注，可能含**此刻不在线**的人画的：
+                      //   画不画由渲染层按"owner 在不在场"过滤，见 renderer/common/room.js）
+  quests: {},         // peerId -> [任务 id]（只含别人的勾选；服务端支持才非空）
+  caps: [],           // 服务端声明的能力（含 'quests' 才会共享勾选的任务）
+  roomHint: null,     // 房间标识前 6 位（排查用，不是暗号）
+  onlineSince: null,
+  attempts: 0,
+});
+
+class RoomClient {
+  /**
+   * @param {object} [opts]
+   * @param {Function} [opts.onState] 状态变化回调（主进程广播给窗口用）
+   * @param {Function} [opts.onLog]   日志回调
+   * @param {Function} [opts.now]     取时间（单测可注入）
+   * @param {Function} [opts.WebSocketImpl] 注入假 WebSocket（单测）
+   */
+  constructor(opts = {}) {
+    this.onState = opts.onState || (() => {});
+    this.onLog = opts.onLog || (() => {});
+    this.now = opts.now || (() => Date.now());
+    this.WebSocketImpl = opts.WebSocketImpl || require('ws');
+    this.handshakeTimeoutMs = Number(opts.handshakeTimeoutMs) > 0 ? Number(opts.handshakeTimeoutMs) : HANDSHAKE_TIMEOUT_MS;
+    this.state = EMPTY_STATE();
+    this.ws = null;
+    this.cfg = null;          // 归一化后的房间配置
+    this.timers = { reconnect: null, ping: null, pong: null, pos: null, handshake: null };
+    this.pendingPos = null;   // 被节流挡住、等着补发的位置
+    this.lastPosAt = 0;
+    this.lastPingAt = 0;
+    this.myQuests = [];       // 我勾选的任务（共享给队友的那份）
+    this.lastQuestsSent = null; // 上一次真的发出去的指纹（内容没变就不重复发）
+    this.closedByUs = false;
+  }
+
+  // ------------------------------------------------------------------ 对外
+  /**
+   * 应用配置（设置页改了地址/房间号/昵称都走这里）。
+   * 返回 true 表示"现在应该在房间里"。
+   */
+  applyConfig(roomCfg) {
+    // 配置里没带 peerId（某个调用方漏了字段）时沿用上一次的身份：
+    // 身份一换，队友那边的颜色、图例开关、以及"我画过的标注归谁"就全乱了。
+    const incoming = roomCfg && typeof roomCfg === 'object' ? { ...roomCfg } : {};
+    if (!incoming.peerId && this.cfg && this.cfg.peerId) incoming.peerId = this.cfg.peerId;
+    const next = normalizeConfig(incoming);
+    const prev = this.cfg;
+    this.cfg = next;
+    this.state.enabled = next.enabled;
+    if (!next.enabled) {
+      this.disconnect('已关闭房间功能');
+      return false;
+    }
+    // 什么时候要重新握手：
+    //   地址/房间号/昵称/身份变了 —— 或者**刚从关切成开**。
+    //   第三条以前漏了：设置页里把"启用房间"勾上、其它字段没动时，sameTarget 会说"没变"，
+    //   于是开关打开却一直不连（GUI 里走"加入房间"按钮能兜住，走"保存"就哑了）。
+    const wasEnabled = !!(prev && prev.enabled);
+    const changed = !prev || !sameTarget(prev, next) || !wasEnabled;
+    if (changed) {
+      this.fatal = null; // 重新开启时清掉上一次的致命错误（房间满/版本不符），给用户一次重试机会
+      this.onLog(`房间配置变化 -> ${next.server.host}:${next.server.port} 昵称=${next.nick}`);
+      this.connect();
+    }
+    return true;
+  }
+
+  connect() {
+    if (!this.cfg || !this.cfg.enabled || !this.cfg.server) return;
+    this.stopTimers();
+    this.closedByUs = false;
+    if (this.ws) {
+      // 先把旧连接的监听摘掉再关：直接 close() 会触发 onClose，那会被当成"意外断线"
+      // 又排一次重连（实测会多出一轮无意义的 1005 重连）。
+      const old = this.ws;
+      this.ws = null;
+      try {
+        if (old.removeAllListeners) old.removeAllListeners();
+      } catch {}
+      try {
+        old.close();
+      } catch {}
+    }
+    const { wsUrl } = this.cfg.server;
+    this.setState({ status: this.state.attempts ? 'reconnecting' : 'connecting', error: null, server: { ...this.cfg.server } });
+    this.onLog(`连接房间 ${wsUrl}`);
+    let ws;
+    try {
+      ws = new this.WebSocketImpl(wsUrl);
+    } catch (e) {
+      this.fail(e.message || String(e));
+      return;
+    }
+    this.ws = ws;
+    ws.on('open', () => this.onOpen());
+    ws.on('message', (raw) => this.onMessage(raw));
+    ws.on('close', (code, reason) => this.onClose(code, reason));
+    ws.on('error', (e) => this.onLog(`连接错误：${e && e.message ? e.message : e}`));
+    // 握手看门狗：TCP 连上了、hello 也发了，但服务端不回 welcome（进程假死/端口后面挂的不是本服务/
+    // 中间设备把帧吞了）——光靠 ws 自己的超时可能要等很久，界面就一直卡在"正在加入…"。
+    // 到点主动掐掉，让上面那条重连逻辑接管（状态会变成"连不上服务端，正在自动重试…"）。
+    if (this.timers.handshake) clearTimeout(this.timers.handshake);
+    this.timers.handshake = setTimeout(() => {
+      this.timers.handshake = null;
+      if (this.ws !== ws) return; // 已经换了新连接，这条是上一个时代的
+      this.onLog(`握手超时（${this.handshakeTimeoutMs}ms）：没等到 welcome`);
+      try {
+        ws.terminate ? ws.terminate() : ws.close();
+      } catch {}
+    }, this.handshakeTimeoutMs);
+    if (this.timers.handshake.unref) this.timers.handshake.unref();
+  }
+
+  disconnect(reason = '主动断开') {
+    this.stopTimers();
+    this.closedByUs = true;
+    if (this.ws) {
+      const old = this.ws;
+      this.ws = null;
+      try {
+        if (old.removeAllListeners) old.removeAllListeners();
+      } catch {}
+      try {
+        old.close();
+      } catch {}
+    }
+    const keep = this.state.enabled && this.cfg && this.cfg.enabled;
+    this.state = { ...EMPTY_STATE(), enabled: keep, server: this.cfg && this.cfg.server ? { ...this.cfg.server } : null, status: keep ? 'off' : 'off' };
+    if (reason) this.onLog(`离开房间：${reason}`);
+    this.emit();
+  }
+
+  /** 我在哪张图（换图/进图时调用，去重 + 未进房时忽略） */
+  setMap(mapId) {
+    const map = P.normMap(mapId);
+    if (!map || map === this.myMap) return;
+    this.myMap = map;
+    this.send({ t: 'map', map });
+  }
+
+  /**
+   * 新一局：自己的定位作废（服务端记住的也要清），并清掉本机看到的队友残留位置。
+   *
+   * 为什么两边都要做：
+   *   - 本机清 -> 队友上一局留下的点不能出现在新局的图上；
+   *   - 发 `newraid` -> 让服务端把我记的旧点抹掉并向其他人广播 `peer-reset`。
+   *     少了这一步，"我这边开新局"时那些没在局内（或没识别到新局）的队友屏幕上
+   *     会一直停着我的旧点，直到我下次按截图键才刷新。
+   *
+   * @param {number} [beforeTs] 只清"早于这个时刻收到"的队友定位（默认全清）
+   * @returns {number} 本机清掉了几个队友的定位
+   */
+  newRaid(beforeTs = Infinity) {
+    const dropped = this.dropPeerPositions(beforeTs);
+    if (dropped) this.emit();
+    this.send({ t: 'newraid' });
+    return dropped;
+  }
+
+  /**
+   * 清掉"早于 beforeTs 收到"的队友定位（只清 pos，不动昵称与他所在的图）。
+   * 比较用的是**本机收到时间** `peer.at`（和本地日志同一个时钟），不是对方的截图时间，
+   * 所以两台机器时钟不一致也不会误判；新局里队友刚发来的定位不会被清掉。
+   */
+  dropPeerPositions(beforeTs = Infinity) {
+    const cut = Number(beforeTs);
+    const limit = Number.isFinite(cut) ? cut : Infinity;
+    let dropped = 0;
+    this.state.peers = this.state.peers.map((p) => {
+      if (!p.pos) return p;
+      if ((Number(p.at) || 0) >= limit) return p;
+      dropped += 1;
+      return { ...p, pos: null };
+    });
+    return dropped;
+  }
+
+  /** 上报定位（带轨迹尾巴）；节流合并，保证最后一条一定会发出去 */
+  setPosition(pos) {
+    if (!pos || !this.cfg || !this.cfg.sharePos) return;
+    const msg = {
+      t: 'pos',
+      map: pos.map,
+      x: pos.x,
+      y: pos.y,
+      z: pos.z,
+      hdg: pos.hdg,
+      ts: pos.ts,
+      trail: Array.isArray(pos.trail) ? pos.trail : undefined,
+    };
+    const now = this.now();
+    if (now - this.lastPosAt >= POS_MIN_INTERVAL_MS) {
+      this.lastPosAt = now;
+      this.send(msg);
+      return;
+    }
+    // 太密了：只留最后一条，等节流窗口过去再补发（丢掉中间的，位置本来就是"最新覆盖旧"）
+    this.pendingPos = msg;
+    if (!this.timers.pos) {
+      const wait = Math.max(0, POS_MIN_INTERVAL_MS - (now - this.lastPosAt));
+      this.timers.pos = setTimeout(() => {
+        this.timers.pos = null;
+        const p = this.pendingPos;
+        this.pendingPos = null;
+        if (p) {
+          this.lastPosAt = this.now();
+          this.send(p);
+        }
+      }, wait);
+      if (this.timers.pos.unref) this.timers.pos.unref();
+    }
+  }
+
+  /** 我画了一笔（服务端会回显，统一 id 与顺序） */
+  sendAnnoAdd(anno) {
+    if (!this.cfg || !this.cfg.shareAnno) return false;
+    return this.send({ t: 'anno', op: 'add', map: anno.map, id: anno.id, kind: anno.kind, color: anno.color, width: anno.width, pts: anno.pts });
+  }
+
+  sendAnnoDel(mapId, id) {
+    if (!this.cfg || !this.cfg.shareAnno) return false;
+    return this.send({ t: 'anno', op: 'del', map: mapId, id });
+  }
+
+  /**
+   * 共享"我勾选的任务"（整份覆盖：任务 id 列表，最多 QUEST_IDS_MAX 个，几 KB 以内）。
+   * 勾选是"整份状态"而不是增量，所以不做 add/del —— 每次变更直接发全量，简单且自愈。
+   * 服务端没声明 quests 能力（老服务端）时静默跳过，不影响位置与标注。
+   */
+  sendQuests(ids) {
+    const list = sanitizeQuestIds(ids) || [];
+    const key = list.join(',');
+    this.myQuests = list;
+    // 内容没变就什么都不做：勾选是集合（顺序已规范化），"我又点了一下"不该产生一次广播
+    if (key === this.lastQuestsSent) return false;
+    this.lastQuestsSent = null; // 内容变了：允许再发一次（还没上线就等 welcome 后补发）
+    return this.flushQuests();
+  }
+
+  /** 把当前这份勾选发给服务端（上线时/内容变化时各调一次；内容没变就不重复发） */
+  flushQuests() {
+    if (!this.cfg || !this.cfg.shareQuests) return false;
+    if (!Array.isArray(this.state.caps) || !this.state.caps.includes('quests')) return false;
+    if (!this.ws || this.ws.readyState !== 1) return false;
+    const list = sanitizeQuestIds(this.myQuests) || [];
+    const key = list.join(',');
+    if (key === this.lastQuestsSent) return false;
+    this.lastQuestsSent = key;
+    return this.send({ t: 'quests', ids: list });
+  }
+
+  /** 给设置页/状态栏看的快照 */
+  snapshot() {
+    return {
+      ...this.state,
+      peers: this.state.peers.map((p) => ({ ...p })),
+      annos: this.state.annos,
+      quests: this.state.quests,
+    };
+  }
+
+  // ------------------------------------------------------------------ 内部
+  setState(patch) {
+    Object.assign(this.state, patch);
+    this.emit();
+  }
+
+  emit() {
+    try {
+      this.onState(this.snapshot());
+    } catch (e) {
+      this.onLog(`状态回调出错：${e.message}`);
+    }
+  }
+
+  send(obj) {
+    if (!this.ws || this.ws.readyState !== 1) return false;
+    try {
+      this.ws.send(JSON.stringify(obj));
+      return true;
+    } catch (e) {
+      this.onLog(`发送失败：${e.message}`);
+      return false;
+    }
+  }
+
+  stopTimers() {
+    for (const k of Object.keys(this.timers)) {
+      if (this.timers[k]) {
+        clearTimeout(this.timers[k]);
+        clearInterval(this.timers[k]);
+        this.timers[k] = null;
+      }
+    }
+  }
+
+  onOpen() {
+    this.onLog('连接已建立，发送 hello');
+    this.myMap = null;
+    this.send({
+      t: 'hello',
+      v: PROTO,
+      room: this.cfg.roomKey,
+      nick: this.cfg.nick,
+      pid: this.cfg.peerId,
+      ver: this.cfg.ver,
+    });
+  }
+
+  onHello() {
+    // 握手完成：看门狗拆掉（不然它会在 8 秒后把自己这条好连接掐了）
+    if (this.timers.handshake) {
+      clearTimeout(this.timers.handshake);
+      this.timers.handshake = null;
+    }
+    this.state.attempts = 0;
+    this.setState({ status: 'online', error: null, onlineSince: this.now() });
+    this.startPing();
+    // 刚进房：把"我勾选的任务"整份发一遍（caps 里没有 quests 的服务端会自动跳过）
+    this.flushQuests();
+    if (this.onOnline) this.onOnline();
+  }
+
+  startPing() {
+    if (this.timers.ping) clearInterval(this.timers.ping);
+    this.timers.ping = setInterval(() => {
+      if (!this.ws || this.ws.readyState !== 1) return;
+      this.lastPingAt = this.now();
+      this.send({ t: 'ping' });
+      if (this.timers.pong) clearTimeout(this.timers.pong);
+      this.timers.pong = setTimeout(() => {
+        this.onLog(`心跳 ${PONG_TIMEOUT_MS}ms 没回应，判定连接已断`);
+        try {
+          this.ws.terminate ? this.ws.terminate() : this.ws.close();
+        } catch {}
+      }, PONG_TIMEOUT_MS);
+      if (this.timers.pong.unref) this.timers.pong.unref();
+    }, PING_INTERVAL_MS);
+    if (this.timers.ping.unref) this.timers.ping.unref();
+  }
+
+  onMessage(raw) {
+    let m = null;
+    try {
+      m = JSON.parse(typeof raw === 'string' ? raw : raw.toString('utf8'));
+    } catch {
+      return;
+    }
+    if (m && m.t === 'pong' && this.timers.pong) {
+      clearTimeout(this.timers.pong);
+      this.timers.pong = null;
+    }
+    switch (m.t) {
+      case 'welcome': {
+        this.state.self = m.self || null;
+        this.state.roomHint = null;
+        this.state.caps = Array.isArray(m.caps) ? m.caps.filter((c) => typeof c === 'string').slice(0, 16) : [];
+        this.state.peers = (m.peers || []).map((p) => ({ id: p.id, nick: p.nick, map: p.map || null, pos: p.pos || null, at: this.now(), quests: sanitizeQuestIds(p.quests) || [] }));
+        this.state.annos = normalizeAnnos(m.annos);
+        this.state.quests = normalizeQuests(m.quests);
+        this.onHello();
+        this.onLog(`已在房间里：${(m.peers || []).length} 个队友，${countAnnos(m.annos)} 笔标注${this.state.caps.includes('quests') ? '，服务端支持共享勾选任务' : ''}`);
+        this.emit();
+        return;
+      }
+      case 'peer-join': {
+        const p = m.peer || {};
+        if (!p.id || p.id === (this.state.self && this.state.self.id)) return;
+        this.state.peers = [...this.state.peers.filter((x) => x.id !== p.id), { id: p.id, nick: p.nick, map: p.map || null, pos: p.pos || null, at: this.now(), quests: sanitizeQuestIds(p.quests) || [] }];
+        if (p.quests) this.state.quests = { ...this.state.quests, [p.id]: sanitizeQuestIds(p.quests) || [] };
+        this.onLog(`队友加入：${p.nick}`);
+        this.emit();
+        return;
+      }
+      case 'peer-left': {
+        const before = this.state.peers.length;
+        this.state.peers = this.state.peers.filter((x) => x.id !== m.id);
+        // 勾选任务直接清掉：他下次进房会把自己的勾选整份重发（onHello -> flushQuests），
+        // 所以不需要留着他的旧勾选。
+        this.state.quests = dropQuestOwner(this.state.quests, m.id);
+        // 标注**故意不删**：服务端本来就留着离场者的标注，渲染层会按"owner 此刻在不在
+        // 房间里"过滤（renderer/common/room.js#annosOfOnlinePeers）—— 图上立刻看不到，
+        // 而他一回来（同一份数据还在）立刻又能看到，不用他重发、也不受"只补发当前这张图"限制。
+        if (before !== this.state.peers.length) this.onLog(`队友离开：${m.id}（他的标注先隐藏，回来即恢复）`);
+        this.emit();
+        return;
+      }
+      case 'peer-quests': {
+        // 队友改了勾选：整份覆盖（含空数组 = 他全取消了）
+        if (m.id) this.state.quests = { ...this.state.quests, [m.id]: sanitizeQuestIds(m.ids) || [] };
+        this.emit();
+        return;
+      }
+      case 'peer-map': {
+        // 他换图了：之前那张图上的定位作废（服务端也不再把旧 pos 发出来）。
+        // 不清的话，队友图上会停着一个"旧图上的假点"，而且越放越旧。
+        this.patchPeer(m.id, { map: m.map || null, pos: null, at: this.now() });
+        this.emit();
+        return;
+      }
+      case 'peer-pos': {
+        this.patchPeer(m.id, { map: m.map || null, pos: pickPos(m), at: this.now() });
+        this.emit();
+        return;
+      }
+      case 'peer-reset': {
+        // 他开了新一局：之前那个点作废（他还没按截图键时不该在图上留着旧点）
+        this.patchPeer(m.id, { pos: null, at: this.now() });
+        this.emit();
+        return;
+      }
+      case 'anno': {
+        this.state.annos = applyAnno(this.state.annos, m);
+        this.emit();
+        return;
+      }
+      case 'err': {
+        const fatal = ['bad-version', 'bad-room', 'room-full', 'replaced'].includes(m.code);
+        this.onLog(`服务端拒绝：${m.code} ${m.msg || ''}`);
+        if (fatal) {
+          // 重连也是同样的结果：标记成致命错误并停止重连，把原因显示给用户
+          this.fatal = m.code;
+          this.closedByUs = true;
+          this.setState({ status: 'error', error: m.msg || m.code });
+        } else {
+          this.setState({ error: m.msg || m.code });
+        }
+        return;
+      }
+      default:
+        return;
+    }
+  }
+
+  patchPeer(id, patch) {
+    // 自己的状态由本地负责：万一服务端（或被冒充的中继）把我的 id 回传过来，
+    // 也不能把自己当成一个"队友"画到地图上。
+    if (!id || (this.state.self && id === this.state.self.id)) return;
+    let hit = false;
+    this.state.peers = this.state.peers.map((p) => {
+      if (p.id !== id) return p;
+      hit = true;
+      return { ...p, ...patch };
+    });
+    if (!hit) {
+      // 没见过的 id（比如刚重连、peer-join 丢了）：先占个位置，等下一帧补齐昵称
+      this.state.peers = [...this.state.peers, { id, nick: '队友', map: patch.map || null, pos: patch.pos || null, at: this.now(), quests: this.state.quests[id] || [] }];
+    }
+  }
+
+  onClose(code, reason) {
+    this.stopTimers();
+    if (this.closedByUs) return;
+    const why = `连接断开（code=${code}${reason ? ` ${reason}` : ''}）`;
+    if (this.fatal) {
+      this.setState({ status: 'error', error: this.state.error || this.fatal });
+      this.onLog(`${why}，服务端已明确拒绝，不再重连`);
+      return;
+    }
+    this.state.attempts += 1;
+    const delay = backoffDelay(this.state.attempts - 1);
+    this.setState({ status: 'reconnecting', error: null, peers: [], annos: {}, quests: {}, caps: [] });
+    this.onLog(`${why}，${Math.round(delay / 1000)}s 后重连（第 ${this.state.attempts} 次）`);
+    this.timers.reconnect = setTimeout(() => {
+      this.timers.reconnect = null;
+      this.connect();
+    }, delay);
+    if (this.timers.reconnect.unref) this.timers.reconnect.unref();
+  }
+
+  fail(msg) {
+    this.setState({ status: 'error', error: msg });
+    this.state.attempts += 1;
+    const delay = backoffDelay(this.state.attempts - 1);
+    this.timers.reconnect = setTimeout(() => {
+      this.timers.reconnect = null;
+      this.connect();
+    }, delay);
+    if (this.timers.reconnect.unref) this.timers.reconnect.unref();
+  }
+
+  /** 进程退出时收尾：别再挂着定时器 */
+  destroy() {
+    this.disconnect('');
+    this.onState = () => {};
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 纯函数助手（单测直接打）
+// ---------------------------------------------------------------------------
+function normalizeConfig(raw) {
+  const cfg = raw && typeof raw === 'object' ? raw : {};
+  const server = parseServer(cfg.url, Number(cfg.port) || DEFAULT_PORT);
+  const roomId = String(cfg.roomId == null ? '' : cfg.roomId).trim();
+  const nick = P.normNick(cfg.nick || '玩家');
+  const peerId = /^[A-Za-z0-9_-]{4,40}$/.test(String(cfg.peerId || '')) ? String(cfg.peerId) : randomPeerId();
+  const key = roomId ? roomKey(roomId, cfg.pass || '') : '';
+  const enabled = !!cfg.enabled && !!server && !!key;
+  return {
+    enabled,
+    server,
+    roomId,
+    roomKey: key,
+    nick,
+    peerId,
+    pass: String(cfg.pass == null ? '' : cfg.pass),
+    sharePos: cfg.sharePos !== false,
+    shareAnno: cfg.shareAnno !== false,
+    shareQuests: cfg.shareQuests !== false,
+    ver: cfg.ver || null,
+  };
+}
+
+function randomPeerId() {
+  const crypto = require('crypto');
+  return `p${crypto.randomBytes(6).toString('hex')}`;
+}
+
+function sameTarget(a, b) {
+  return (
+    !!a.server &&
+    !!b.server &&
+    a.server.host === b.server.host &&
+    a.server.port === b.server.port &&
+    a.server.secure === b.server.secure &&
+    a.roomKey === b.roomKey &&
+    a.nick === b.nick &&
+    a.peerId === b.peerId
+  );
+}
+
+function pickPos(m) {
+  return { map: m.map, x: m.x, y: m.y, z: m.z, hdg: m.hdg, ts: m.ts, trail: m.trail };
+}
+
+/** 服务端来的地图 id 与笔画 id 也必须能当键用（和 server/protocol.js 同一条规则） */
+const MAP_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
+// 这几个键当对象键会把原型搞坏，一律不要
+const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+function safeMapId(v) {
+  const s = String(v == null ? '' : v);
+  if (!MAP_RE.test(s) || DANGEROUS_KEYS.has(s)) return null;
+  return s;
+}
+
+function normalizeAnnos(raw) {
+  // 普通对象就够了：地图 id 已经过白名单正则 + 危险键黑名单，__proto__ 之类的进不来
+  // （不用 Object.create(null)，免得把无原型对象漏到 IPC / 渲染层去）
+  const out = {};
+  if (!raw || typeof raw !== 'object') return out;
+  for (const [rawMapId, list] of Object.entries(raw)) {
+    const mapId = safeMapId(rawMapId);
+    if (!mapId || !Array.isArray(list)) continue;
+    const items = list
+      .map((a) => sanitizeIncoming(a, a && a.owner))
+      .filter(Boolean);
+    if (items.length) out[mapId] = items;
+  }
+  return out;
+}
+
+function sanitizeIncoming(a, owner) {
+  if (!a || typeof a !== 'object' || !P.KINDS.has(a.kind)) return null;
+  // 必须带合法的 owner：界面上每个队友笔画都挂在一个"人的图例开关"下，
+  // 没有 owner 的笔画会画出来却关不掉，等于破坏"地图上有什么，图例里就有什么"的硬约束。
+  const ownerId = String(owner || '');
+  if (!ID_RE.test(ownerId)) return null;
+  const id = String(a.id == null ? '' : a.id);
+  if (!ID_RE.test(id)) return null;
+  const pts = Array.isArray(a.pts) ? a.pts.filter((p) => p && Number.isFinite(Number(p.x)) && Number.isFinite(Number(p.z))) : [];
+  if (pts.length < 2) return null;
+  return {
+    id,
+    kind: a.kind,
+    color: /^#[0-9a-f]{6}$/i.test(String(a.color)) ? String(a.color).toLowerCase() : '#f87171',
+    width: P.clampWidth(a.width),
+    pts: pts.map((p) => ({ x: Number(p.x), z: Number(p.z) })),
+    owner: ownerId,
+    at: Number.isFinite(Number(a.at)) ? Number(a.at) : 0,
+  };
+}
+
+/** 收到一条标注广播：add 覆盖同 id，del 删掉 */
+function applyAnno(annos, m) {
+  const mapId = safeMapId(m && m.map);
+  if (!mapId) return annos;
+  const out = { ...annos };
+  const list = Array.isArray(out[mapId]) ? [...out[mapId]] : [];
+  const i = list.findIndex((a) => a.id === m.id);
+  if (m.op === 'del') {
+    if (i < 0) return annos;
+    list.splice(i, 1);
+  } else {
+    const item = sanitizeIncoming(m, m.owner);
+    if (!item) return annos;
+    if (i >= 0) list[i] = item;
+    else list.push(item);
+  }
+  if (list.length) out[mapId] = list;
+  else delete out[mapId];
+  return out;
+}
+
+function countAnnos(raw) {
+  if (!raw || typeof raw !== 'object') return 0;
+  return Object.values(raw).reduce((n, list) => n + (Array.isArray(list) ? list.length : 0), 0);
+}
+
+// ---------------------------------------------------------------------------
+// 勾选任务（共享给队友）
+// ---------------------------------------------------------------------------
+const QUEST_IDS_MAX = 200; // 一个人最多共享多少个勾选任务（服务端同一条上限）
+// 任务 id 的规则要和服务端 server/protocol.js 的 QUEST_ID_RE 一致（≥6 位），
+// 否则客户端会把服务端一定会丢掉的垃圾 id 也发出去。
+const QUEST_ID_RE = /^[A-Za-z0-9_-]{6,40}$/;
+
+/** 任务 id 列表：去重、排序（两端对同一份集合得到同一个指纹）、限长、过滤脏数据 */
+function sanitizeQuestIds(raw) {
+  if (!Array.isArray(raw)) return null;
+  const out = [];
+  const seen = new Set();
+  for (const v of raw) {
+    if (out.length >= QUEST_IDS_MAX) break;
+    const s = String(v == null ? '' : v);
+    if (!QUEST_ID_RE.test(s) || DANGEROUS_KEYS.has(s) || seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  // 顺序无关：勾选是集合，"我又点了一下"不该被当成内容变化（省掉无意义的重发）
+  out.sort();
+  return out;
+}
+
+/** 服务端发来的 "peerId -> [任务 id]" 映射：逐项过一遍过滤 */
+function normalizeQuests(raw) {
+  const out = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const [owner, ids] of Object.entries(raw)) {
+    if (!ID_RE.test(owner) || DANGEROUS_KEYS.has(owner)) continue;
+    const list = sanitizeQuestIds(ids);
+    if (list && list.length) out[owner] = list;
+  }
+  return out;
+}
+
+function dropQuestOwner(quests, owner) {
+  if (!quests || !Object.prototype.hasOwnProperty.call(quests, owner)) return quests;
+  const out = { ...quests };
+  delete out[owner];
+  return out;
+}
+
+module.exports = {
+  RoomClient,
+  parseServer,
+  probeServer,
+  backoffDelay,
+  normalizeConfig,
+  normalizeAnnos,
+  applyAnno,
+  sanitizeQuestIds,
+  normalizeQuests,
+  dropQuestOwner,
+  randomPeerId,
+  PROTO,
+  DEFAULT_PORT,
+  POS_MIN_INTERVAL_MS,
+  MAX_BACKOFF_MS,
+  QUEST_IDS_MAX,
+};

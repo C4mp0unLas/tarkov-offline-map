@@ -1,0 +1,106 @@
+{
+  "name": "tarkov-offline-map",
+  "productName": "塔科夫地图",
+  "version": "2.5.3",
+  "description": "塔科夫地图 - 日志自动识别地图 + 截图定位 + 悬浮小地图，默认完全本地运行；房间联机（和队友互看位置与标注）为可选功能",
+  "main": "main.js",
+  "private": true,
+  "author": "NepPure",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/C4mp0unLas/tarkov-offline-map.git"
+  },
+  "homepage": "https://github.com/C4mp0unLas/tarkov-offline-map",
+  "bugs": {
+    "url": "https://github.com/C4mp0unLas/tarkov-offline-map/issues"
+  },
+  "scripts": {
+    "start": "electron .",
+    "runclient": "electron .",
+    "smoke": "electron . --smoke-test",
+    "visual-test": "electron . --visual-test",
+    "test": "node --test \"test/*.test.js\"",
+    "test:server": "npm --prefix server run test",
+    "test:all": "npm test && npm run test:server",
+    "verify": "node tools/verify-all.js",
+    "verify:list": "node tools/verify-all.js --list",
+    "verify:dev": "node tools/verify-all.js --group=dev",
+    "verify:ui": "node tools/verify-all.js --group=ui",
+    "verify:all": "npm run test:all && npm run verify",
+    "simulate": "node tools/simulate.js",
+    "room": "node server/server.js",
+    "room:peer": "node tools/fake-peer.js",
+    "fetch:data": "node tools/fetch-all.js",
+    "fetch:tiles": "node tools/fetch-tiles.js",
+    "fetch:quests": "node tools/fetch-quests.js",
+    "fetch:icons": "node tools/fetch-icons.js",
+    "fetch:season": "node tools/fetch-season.js",
+    "fetch:season:images": "node tools/fetch-season-images.js",
+    "check:upstream": "node tools/check-upstream.js",
+    "changelog": "node tools/make-changelog.js",
+    "make:icon": "node tools/make-icon.js",
+    "dist": "electron-builder --win portable --publish never",
+    "dist:ci": "electron-builder --win portable --publish never",
+    "dist:server": "node tools/make-server-exe.js",
+    "dist:server:ci": "node tools/make-server-exe.js",
+    "fetch:upstream": "node tools/fetch-upstream.js",
+    "fetch:economy": "node tools/fetch-economy.js",
+    "fetch:market": "node tools/fetch-market.js",
+    "fetch:bosses": "node tools/fetch-bosses.js",
+    "fetch:guides": "node tools/fetch-task-guides.js",
+    "fetch:shots": "node tools/fetch-task-shots.js",
+    "fetch:item-icons": "node tools/fetch-item-icons.js",
+    "fetch:requirements": "node tools/fetch-requirements.js",
+    "fetch:btr": "node tools/fetch-btr.js",
+    "fetch:traits": "node tools/fetch-traits.js",
+    "make:splash": "python tools/make-splash.py"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8",
+    "esbuild": "^0.28.2",
+    "postject": "^1.0.0-alpha.6"
+  },
+  "build": {
+    "appId": "com.neppure.tarkov-offline-map",
+    "productName": "塔科夫地图",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "src/**/*",
+      "renderer/**/*",
+      "data/**/*",
+      "package.json",
+      "THIRD_PARTY_NOTICES.md",
+      "server/protocol.js"
+    ],
+    "asarUnpack": [
+      "data/**"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.png"
+    },
+    "portable": {
+      "artifactName": "塔科夫地图-${version}.exe",
+      "requestExecutionLevel": "user",
+      "splashImage": "build/splash.bmp",
+      "useZip": true
+    }
+  },
+  "dependencies": {
+    "ws": "^8.21.3"
+  }
+}
