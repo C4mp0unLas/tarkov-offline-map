@@ -24,8 +24,7 @@ function gameRootCandidates(values) {
 function findGameRoot(values, fsApi = fs) {
   for (const candidate of gameRootCandidates(values)) {
     try {
-      if (fsApi.existsSync(path.join(candidate, 'EscapeFromTarkov.exe'))
-        && fsApi.existsSync(path.join(candidate, 'Logging.config'))) return path.resolve(candidate);
+      if (fsApi.existsSync(path.join(candidate, 'EscapeFromTarkov.exe'))) return path.resolve(candidate);
     } catch {}
   }
   return null;

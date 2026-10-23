@@ -70,7 +70,7 @@ export const LIVE_FIELDS = [
 /** 设置页里"只做事、不写配置"的控件（选了目录、打开文件夹、按下按键捕获…） */
 export const LIVE_ACTIONS = [
   '#set-logs-pick', '#set-logs-open', '#set-shots-pick', '#set-shots-open', '#set-game-path-pick', '#set-game-path-open',
-  '#set-boss-apply', '#set-boss-discover',
+  '#set-boss-discover',
   '#set-autoshot-capture', '#settings-about', '#settings-close',
   '#room-test', '#room-connect', '#room-disconnect',
 ];

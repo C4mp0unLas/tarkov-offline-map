@@ -21,7 +21,6 @@ const { readJsonFile } = require('./src/json-file');
 const { LogWatcher } = require('./src/log-watcher');
 const { BossMonitor } = require('./src/boss-monitor');
 const { findGameRoot, collectLauncherPathValues } = require('./src/game-install');
-const bossLogConfig = require('./src/boss-log-config');
 const { normalizeFilters, filterSnapshot, BossNotifications } = require('./src/boss-monitor-options');
 const { ScreenshotWatcher } = require('./src/screenshot-watcher');
 const { AutoShotRunner, createKeyPressHelper, normalizeKeyName, clampIntervalSec, dryRunRequested } = require('./src/auto-shot');
@@ -302,12 +301,8 @@ const state = {
 
 const bossMonitor = new BossMonitor();
 let bossUpdateTimer = null;
-let bossConfigBusy = false;
-let bossConfigPromptSession = null;
 let bossReplayReady = false;
 const bossNotifications = new BossNotifications();
-let bossLoggingPoll = null;
-state.bossLogging = { state: 'idle', message: '尚未检查日志配置' };
 state.bossMonitor = bossMonitor.snapshot();
 
 let lastStateWrite = 0;
@@ -435,81 +430,10 @@ function publishBossMonitor() {
     notice.show();
   }
   if (snapshot.mode === 'local-pve' && bossReplayReady && settings.bossMonitorEnabled !== false) {
-    ensureBossLoggingConfig(snapshot).catch((e) => appLog(`[boss] 配置准备失败: ${e.message}`));
     if (snapshot.btr && snapshot.btr.status === 'confirmed') {
       bossUpdateTimer = setTimeout(publishBossMonitor, 1000);
     }
   }
-}
-
-function setBossLogging(value) {
-  state.bossLogging = value; broadcast({ bossLogging: value });
-}
-
-function watchBossLogging(gameRoot, requestId) {
-  if (bossLoggingPoll) clearInterval(bossLoggingPoll);
-  bossLoggingPoll = setInterval(() => {
-    const result = bossLogConfig.readStatus(app.getPath('userData'), gameRoot);
-    if (!result || result.requestId !== requestId) return;
-    if (result.state === 'configured') {
-      try { if (bossLogConfig.planLoggingConfig(fs.readFileSync(path.join(gameRoot, 'Logging.config'), 'utf8')).changed) throw new Error('日志级别未生效'); }
-      catch (error) { result.state = 'error'; result.message = error.message; }
-    }
-    setBossLogging(result);
-    if (['configured', 'error'].includes(result.state)) { clearInterval(bossLoggingPoll); bossLoggingPoll = null; }
-  }, 1000);
-}
-
-async function applyBossLoggingConfig() {
-  if (bossConfigBusy) return { ok: false, state: 'busy', message: '日志配置操作正在进行' };
-  bossConfigBusy = true;
-  try {
-    const gameRoot = findGameRoot([settings.gamePath]);
-    if (!gameRoot) throw new Error('请先选择有效的游戏安装目录');
-    const planned = bossLogConfig.planLoggingConfig(fs.readFileSync(path.join(gameRoot, 'Logging.config'), 'utf8'));
-    if (!planned.changed) {
-      const result = { ok: true, state: 'configured', message: '已读取核验：aiData Trace、application Debug、backend Information（或更详细）；设置长期保留', gameRoot };
-      setBossLogging(result); return result;
-    }
-    setBossLogging({ state: 'authorizing', message: '正在请求管理员权限；尚未确认写入' });
-    const result = await bossLogConfig.runElevated(gameRoot, app.getPath('userData'), { onStatus: setBossLogging });
-    if (result.state === 'waiting-game-exit') watchBossLogging(gameRoot, result.requestId);
-    appLog('[boss] 日志配置状态: ' + result.state);
-    return { ok: true, ...result };
-  } catch (error) {
-    const result = { ok: false, state: 'error', message: error.message };
-    setBossLogging(result); appLog('[boss] 日志配置失败: ' + error.message); return result;
-  } finally { bossConfigBusy = false; }
-}
-
-async function ensureBossLoggingConfig(snapshot) {
-  const { session, raidToken } = snapshot;
-  const promptKey = session + '|' + raidToken;
-  if (bossConfigBusy || bossConfigPromptSession === promptKey || bossLoggingPoll || !isCurrentLocalBossSession(session, raidToken)) return;
-  bossConfigPromptSession = promptKey;
-  let gameRoot = findGameRoot([settings.gamePath]);
-  if (!gameRoot) {
-    const picked = await dialog.showOpenDialog({ title: '选择 Escape from Tarkov 游戏安装目录', properties: ['openDirectory'] });
-    if (!isCurrentLocalBossSession(session, raidToken) || picked.canceled) return;
-    gameRoot = findGameRoot(picked.filePaths);
-    if (!gameRoot) return;
-    settings = { ...settings, gamePath: gameRoot }; saveSettings(); broadcast({});
-  }
-  try {
-    if (!bossLogConfig.planLoggingConfig(fs.readFileSync(path.join(gameRoot, 'Logging.config'), 'utf8')).changed) {
-      setBossLogging({ state: 'configured', message: '已读取核验：日志级别已就绪；设置长期保留', gameRoot }); return;
-    }
-    const choice = await dialog.showMessageBox({ type: 'info', title: '配置本地 PvE 监控日志',
-      message: '提高 aiData、application 和 backend 日志级别需要 Windows 管理员权限。游戏运行时会等待退出后备份并应用，下次启动游戏生效。配置长期保留，关闭监控、进入在线战局或退出小地图均不自动恢复。游戏更新或启动器修复后可在设置中重新应用。',
-      buttons: ['应用日志设置', '暂不调整'], defaultId: 0, cancelId: 1 });
-    if (choice.response === 0 && isCurrentLocalBossSession(session, raidToken)) await applyBossLoggingConfig();
-  } catch (error) { setBossLogging({ state: 'error', message: error.message }); }
-}
-
-function isCurrentLocalBossSession(session, raidToken) {
-  const current = bossMonitor.snapshot();
-  return bossReplayReady && settings && settings.bossMonitorEnabled !== false
-    && bossMonitor.session === session && current.mode === 'local-pve' && current.raidToken === raidToken;
 }
 
 // ---------------------------------------------------------------------------
@@ -1341,7 +1265,6 @@ function setupIpc() {
   // 要等到"下一个状态事件"才会出现 —— 队友不动、你也不按截图键，那就一直空着。
   ipcMain.handle('state:get', () => ({ ...state, config: settings, room: room ? room.snapshot() : null }));
   ipcMain.handle('config:get', () => settings);
-  ipcMain.handle('boss:apply-logging', () => applyBossLoggingConfig());
   ipcMain.handle('boss:discover-game', () => {
     const found = detectGameDirs();
     if (found.gamePath) { settings = { ...settings, gamePath: found.gamePath }; saveSettings(); broadcast({}); }
@@ -1350,7 +1273,7 @@ function setupIpc() {
   ipcMain.handle('config:set', (_e, patch) => {
     if (patch && Object.prototype.hasOwnProperty.call(patch, 'gamePath')) {
       const gameRoot = findGameRoot([patch.gamePath]);
-      if (!gameRoot) throw new Error('所选游戏目录无效，需包含 EscapeFromTarkov.exe 和 Logging.config');
+      if (!gameRoot) throw new Error('所选游戏目录无效，需包含 EscapeFromTarkov.exe');
       patch.gamePath = gameRoot;
     }
     if (patch?.bossMapFilters) patch.bossMapFilters = normalizeFilters({ ...settings.bossMapFilters, ...patch.bossMapFilters });
@@ -1389,11 +1312,10 @@ function setupIpc() {
       if (settings.bossMonitorEnabled === false || bossMonitor.snapshot().mode !== 'local-pve') {
         if (bossUpdateTimer) clearTimeout(bossUpdateTimer);
         bossUpdateTimer = null;
-        publishBossMonitor();
-      } else bossConfigPromptSession = null;
+      }
       publishBossMonitor();
     }
-    if (patch && (Object.hasOwn(patch, 'bossMapFilters') || Object.hasOwn(patch, 'gamePath'))) { bossConfigPromptSession = null; publishBossMonitor(); }
+    if (patch && (Object.hasOwn(patch, 'bossMapFilters') || Object.hasOwn(patch, 'gamePath'))) { publishBossMonitor(); }
     syncWatchers();
     if (patch && Object.prototype.hasOwnProperty.call(patch, 'autoShot')) syncAutoShot();
     // 截图目录变了要重算"目录在不在"（不在就不按了）
@@ -2405,7 +2327,6 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
-  if (bossLoggingPoll) clearInterval(bossLoggingPoll);
   if (bossUpdateTimer) clearTimeout(bossUpdateTimer);
   if (miniWatchdog) { clearInterval(miniWatchdog); miniWatchdog = null; }
   stopMiniDrag('quit');

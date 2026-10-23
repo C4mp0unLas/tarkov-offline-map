@@ -9,7 +9,6 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.on('state', h);
     return () => ipcRenderer.removeListener('state', h);
   },
-  applyBossLogging: () => ipcRenderer.invoke('boss:apply-logging'),
   discoverGame: () => ipcRenderer.invoke('boss:discover-game'),
   getConfig: () => ipcRenderer.invoke('config:get'),
   setConfig: (patch) => ipcRenderer.invoke('config:set', patch),

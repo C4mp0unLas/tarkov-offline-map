@@ -1,5 +1,7 @@
 Boss Monitor functionality in this project is adapted from Tarkov Boss Monitor 1.0.16 (https://github.com/seongjin-lab/tarkov-boss).
 
+The companion ZIP also redistributes the unmodified official TarkovBossMonitor-Setup-1.0.16-win-x64.exe under the same MIT license. It is a separate installer, not launched by the minimap. The pinned source URL, SHA-256 and original documentation are preserved in third_party/tarkov-boss and in the bundle.
+
 Copyright (c) 2026 seongjin-lab
 
 MIT License

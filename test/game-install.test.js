@@ -7,12 +7,12 @@ const os = require('os');
 const path = require('path');
 const { findGameRoot, collectLauncherPathValues } = require('../src/game-install');
 
-test('game install discovery validates both executable and Logging.config', () => {
+test('game install discovery needs only the executable, without a logging configuration', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'eft-root-'));
   try {
-    fs.writeFileSync(path.join(root, 'EscapeFromTarkov.exe'), '');
     assert.equal(findGameRoot([root]), null);
-    fs.writeFileSync(path.join(root, 'Logging.config'), '{"rules":[]}');
+    fs.writeFileSync(path.join(root, 'EscapeFromTarkov.exe'), '');
+    assert.equal(findGameRoot([root]), root);
     assert.equal(findGameRoot([path.join(root, 'EscapeFromTarkov.exe')]), root);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });

@@ -194,11 +194,11 @@
             <button type="button" id="set-game-path-pick" title="选择包含 EscapeFromTarkov.exe 的目录">选择游戏目录…</button>
             <button type="button" id="set-game-path-open" title="在资源管理器里打开游戏目录">打开文件夹</button>
           </div>
-          <div class="dir-row"><button type="button" id="set-boss-discover">自动查找游戏目录</button><button type="button" id="set-boss-apply">应用并核验日志设置</button></div>
+          <div class="dir-row"><button type="button" id="set-boss-discover">自动查找游戏目录</button></div>
           <label class="row"><input type="checkbox" id="set-boss-monitor" /> 启用本地 PvE 首领监控</label>
-          <div class="hint" id="set-boss-config-state" role="status" aria-live="polite"></div>
+          <div class="hint" id="set-boss-log-status" role="status" aria-live="polite"></div>
           <div class="hint">日志目录用来识别进图与地图，截图目录用来读坐标。手输路径在<b>回车</b>或点到别处时生效。</div>
-          <div class="hint">监控仅在日志确认本地 PvE 战局后启动；在线 PvP / PvE 时模块完全隐藏。提高游戏日志级别需要管理员确认，配置会先备份、写入后核验并长期保留；关闭监控、进入在线战局或退出程序均不自动恢复。游戏更新或启动器修复后请重新应用。</div>
+          <div class="hint">监控仅在日志确认本地 PvE 战局后启动；在线 PvP / PvE 时模块完全隐藏。小地图只读取现有日志，不修改游戏配置；日志详细程度请通过配套 Tarkov Boss Monitor 1.0.16 设置。日志缺少刷新、坐标或死亡记录时，相应信息无法显示或确认。</div>
         </section>
         <section class="settings-card">
           <h3>首领监控 · 1.0.16</h3>

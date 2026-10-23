@@ -111,16 +111,9 @@ async function init() {
   $('#set-shots-open').addEventListener('click', () => openDir($('#set-shots').value.trim()));
   $('#set-game-path-pick').addEventListener('click', () => pickDirInto('#set-game-path', '选择 Escape from Tarkov 游戏目录'));
   $('#set-game-path-open').addEventListener('click', () => openDir($('#set-game-path').value.trim()));
-  $('#set-boss-apply').addEventListener('click', async () => {
-    const button = $('#set-boss-apply'); button.disabled = true;
-    $('#set-boss-config-state').textContent = '正在请求管理员权限并核验配置…';
-    try { const result = await api.applyBossLogging(); $('#set-boss-config-state').textContent = result.message || result.state; }
-    catch (error) { $('#set-boss-config-state').textContent = '配置未完成：' + error.message; }
-    finally { button.disabled = false; }
-  });
   $('#set-boss-discover').addEventListener('click', async () => {
-    try { const result = await api.discoverGame(); $('#set-game-path').value = result.gamePath || ''; $('#set-boss-config-state').textContent = result.gamePath ? '已找到游戏目录，可应用日志设置' : '未自动找到，请选择游戏目录'; }
-    catch (error) { $('#set-boss-config-state').textContent = error.message; }
+    try { const result = await api.discoverGame(); $('#set-game-path').value = result.gamePath || ''; $('#set-boss-log-status').textContent = result.gamePath ? '已找到游戏目录；监控只读取现有日志' : '未自动找到，请选择游戏目录'; }
+    catch (error) { $('#set-boss-log-status').textContent = error.message; }
   });
   $('#boss-filter-map').addEventListener('input', renderBossFilterRoles);
   $('#boss-filter-mode').addEventListener('input', saveBossMapFilter);
@@ -429,7 +422,7 @@ async function saveBossMapFilter() {
   const filter = { mode: $('#boss-filter-mode').value, roles: [...$('#boss-filter-roles').querySelectorAll('input:checked')].map(input => input.value) };
   state.cfg.bossMapFilters = { ...state.cfg.bossMapFilters, [key]: filter };
   try { await api.setConfig({ bossMapFilters: { [key]: filter } }); renderBossFilterRoles(); }
-  catch (error) { $('#set-boss-config-state').textContent = '筛选未保存：' + error.message; }
+  catch (error) { $('#set-boss-log-status').textContent = '筛选未保存：' + error.message; }
 }
 
 function openSettings() {
@@ -437,7 +430,7 @@ function openSettings() {
   $('#set-logs').value = c.logsPath || '';
   $('#set-shots').value = c.screenshotsPath || '';
   $('#set-game-path').value = c.gamePath || '';
-  $('#set-boss-config-state').textContent = state.bossLogging?.message || '点击应用并核验日志设置；配置长期保留';
+  $('#set-boss-log-status').textContent = '只读取现有日志；日志详细程度请通过 Tarkov Boss Monitor 1.0.16 设置';
   $('#set-boss-notifications').checked = c.bossNotifications !== false;
   initBossMapFilters();
   $('#set-boss-monitor').checked = c.bossMonitorEnabled !== false;
@@ -691,7 +684,7 @@ function applyControlNow(sel) {
   applyPatchToViews(patch);
   api.setConfig(patch).catch((error) => {
     if (field.path === 'gamePath') {
-      $('#set-boss-config-state').textContent = `游戏目录未保存：${error.message}`;
+      $('#set-boss-log-status').textContent = `游戏目录未保存：${error.message}`;
       api.getConfig().then((config) => { $('#set-game-path').value = config.gamePath || ''; }).catch(() => {});
     }
   });
@@ -859,7 +852,6 @@ function renderBossPanel(monitor) {
 async function applyMainState(s) {
   if (!s) return;
   const revision = ++mainStateRevision;
-  if (s.bossLogging) { state.bossLogging = s.bossLogging; $('#set-boss-config-state').textContent = s.bossLogging.message || s.bossLogging.state; }
   latestBossMonitor = s.bossMonitor || null;
   renderBossPanel(latestBossMonitor);
   const wantedId = s.mapId;

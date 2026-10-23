@@ -415,7 +415,8 @@ async function main() {
       const legend = document.querySelector('#legend-panel').getBoundingClientRect();
       const work = document.querySelector('#workarea').getBoundingClientRect();
       return {
-        w: Math.round(r.width), h: Math.round(r.height),
+        // Keep fractional CSS pixels, matching MapView and SVG viewBox measurements.
+        w: r.width, h: r.height,
         viewBox: svg ? svg.getAttribute('viewBox') : null,
         worldT: world ? world.getAttribute('transform') : null,
         player: m ? { x: Math.round(Number(m[1])), y: Math.round(Number(m[2])) } : null,

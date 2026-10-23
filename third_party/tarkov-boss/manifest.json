@@ -1,0 +1,12 @@
+{
+  "name": "Tarkov Boss Monitor",
+  "version": "1.0.16",
+  "repository": "https://github.com/seongjin-lab/tarkov-boss",
+  "release": "https://github.com/seongjin-lab/tarkov-boss/releases/tag/v1.0.16",
+  "fileName": "TarkovBossMonitor-Setup-1.0.16-win-x64.exe",
+  "size": 75228310,
+  "sha256": "83cd497fabbcc4b07302c99eeeb164fc147a081cb75e7130c2efa1ccc66159d4",
+  "download": "https://github.com/seongjin-lab/tarkov-boss/releases/download/v1.0.16/TarkovBossMonitor-Setup-1.0.16-win-x64.exe",
+  "license": "MIT",
+  "copyright": "Copyright (c) 2026 seongjin-lab"
+}

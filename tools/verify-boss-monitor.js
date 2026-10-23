@@ -8,18 +8,21 @@ const { cdp, evaluate, waitFor, waitForTarget, sleep } = require('./lib/cdp');
 const { makeProfile, createReport } = require('./lib/suite');
 const ROOT = path.join(__dirname, '..');
 const PORT = Number(process.argv.find(a => a.startsWith('--port='))?.split('=')[1] || 9456);
-const report = createReport('首领监控死亡显示与图标稳定性');
+const report = createReport('只读首领监控、死亡显示与图标稳定性');
 const stamp = '2026-10-15 12:00:';
 const line = (body, channel = 'application', at = '00') => `${stamp}${at}.000|1.2.0|Trace|${channel}|${body}\n`;
 async function run() {
   const prof = makeProfile('boss-icons-', { miniVisible: true, bossMonitorEnabled: true, miniRadius: 500 });
   let app;
+  let expectedInputs;
+  let gameRoot;
+  let main;
   try {
-    const gameRoot = prof.path('fake-game');
+    gameRoot = prof.path('fake-game');
     fs.mkdirSync(gameRoot);
     fs.writeFileSync(path.join(gameRoot, 'EscapeFromTarkov.exe'), '');
     fs.writeFileSync(path.join(gameRoot, 'Logging.config'), JSON.stringify({ rules: [
-      { fileName: 'aiData', minLevel: 'Trace' }, { fileName: 'application', minLevel: 'Debug' },
+      { fileName: 'aiData', minLevel: 'Error' }, { fileName: 'application', minLevel: 'Debug' },
       { fileName: 'backend', minLevel: 'Information' },
     ] }));
     const configPath = prof.path('settings.json');
@@ -38,11 +41,18 @@ async function run() {
       ['pmcUSEC', 'usec1', 4], ['pmcUSEC', 'usec2', 5],
       ['followerBully', 'guard1', 6], ['followerBully', 'guard2', 7],
     ].map(([role, profile, id]) => line(`Bot activate role:${role} pos:(1,2,3) profileId:${profile} id:${id}`, 'aiData', '05')).join(''));
+    // Deliberately insufficient logging levels must never prompt or rewrite the configuration.
+    expectedInputs = new Map([gameRoot, dir].flatMap(folder => fs.readdirSync(folder)
+      .map(name => { const file = path.join(folder, name); return [file, fs.readFileSync(file)]; })));
+    const appendLog = (file, value) => {
+      expectedInputs.set(file, Buffer.concat([expectedInputs.get(file), Buffer.from(value)]));
+      fs.appendFileSync(file, value);
+    };
     const launched = await launchReady({ port: PORT, userData: prof.userData, cwd: ROOT,
       match: t => t.url.endsWith('/map.html'), timeoutMs: 30000 });
     app = launched.app;
     if (launched.degraded) console.log('Electron fallback arguments: ' + JSON.stringify(launched.usedArgs));
-    const main = launched.target;
+    main = launched.target;
     await evaluate(main.webSocketDebuggerUrl, 'window.api.ensureMini()');
     const mini = await waitForTarget(PORT, t => t.url.endsWith('/minimap.html'));
     if (!mini) throw new Error('Minimap did not open');
@@ -82,8 +92,8 @@ async function run() {
     report.check('监控图标和面板使用首领原名', await evaluate(main.webSocketDebuggerUrl,
       'document.querySelector(".boss-log-marker text").textContent.includes("Killa") && document.getElementById("boss-panel-body").textContent.includes("Killa")'));
     for (let i = 0; i < 5; i++) {
-      fs.appendFileSync(appFile, line('GC iteration ' + i, 'application', '06'));
-      fs.appendFileSync(aiFile, line('AI tick ' + i, 'aiData', '06'));
+      appendLog(appFile, line('GC iteration ' + i, 'application', '06'));
+      appendLog(aiFile, line('AI tick ' + i, 'aiData', '06'));
       await sleep(800);
     }
     for (const [i, page] of pages.entries()) {
@@ -109,7 +119,7 @@ async function run() {
     const deathLogs = (ids, at) => ids.map(id => line('bot dispose:' + id, 'aiData', at)
       + line('Squad patrol reassigned', 'aiData', at)
       + line('BotDied pos:(4,5,6)', 'aiData', at)).join('');
-    fs.appendFileSync(aiFile, deathLogs([1, 2, 4, 6], '07'));
+    appendLog(aiFile, deathLogs([1, 2, 4, 6], '07'));
     for (const name of ['AI PMC · BEAR', 'AI PMC · USEC']) {
       const updated = await waitFor(async () => {
         const text = await rowText(name);
@@ -137,7 +147,7 @@ async function run() {
       })()`);
       report.check((i ? '悬浮地图' : '主地图') + '真实死亡日志更新图标且不闪烁', result.retained && result.dead, JSON.stringify(result));
     }
-    fs.appendFileSync(aiFile, deathLogs([3, 7], '08')
+    appendLog(aiFile, deathLogs([3, 7], '08')
       + line('Bot activate role:pmcUSEC pos:(8,2,9) profileId:usec3 id:8', 'aiData', '08'));
     const accumulated = await waitFor(async () => {
       const bear = await rowText('AI PMC · BEAR'), usec = await rowText('AI PMC · USEC');
@@ -159,14 +169,14 @@ async function run() {
       })()`);
       report.check((i ? '悬浮地图' : '主地图') + '状态和视角更新复用首领图标', result.recolored && result.moved && result.retained, JSON.stringify(result));
     }
-    fs.appendFileSync(aiFile, [
+    appendLog(aiFile, [
       ['bossScourgeEventLab', 'scourge', 20], ['followerScourgeEventLab', 'scourgeguard', 21],
       ['exUsecFree', 'rogue', 22], ['pmcBot', 'raider', 23],
     ].map(([role, profile, id]) => line('Bot activate role:' + role + ' pos:(2,3,4) profileId:' + profile + ' id:' + id, 'aiData', '09')).join(''));
     report.check('1.0.16 新角色在实际日志管线中显示原名与计数', await waitFor(async () =>
       (await rowText('Scourge')).includes('推测存活 1') && (await rowText('Scourge 随从')).includes('推测存活 1')
       && (await rowText('Rogue · 游荡者')).includes('实际激活 1') && (await rowText('Raider · 掠夺者')).includes('实际激活 1'), 5000));
-    fs.appendFileSync(aiFile, deathLogs([20, 21, 22, 23], '10'));
+    appendLog(aiFile, deathLogs([20, 21, 22, 23], '10'));
     report.check('Scourge 及随从、Rogue 和 Raider 均更新确认死亡', await waitFor(async () =>
       (await rowText('Scourge')).includes('死亡已确认 1') && (await rowText('Scourge 随从')).includes('死亡已确认 1')
       && (await rowText('Rogue · 游荡者')).includes('死亡已确认 1') && (await rowText('Raider · 掠夺者')).includes('死亡已确认 1'), 5000));
@@ -180,21 +190,47 @@ async function run() {
     await evaluate(main.webSocketDebuggerUrl, 'document.getElementById("btn-settings").click()');
     report.check('设置页实际打开并提供 Scourge 筛选选项', await waitFor(() => evaluate(main.webSocketDebuggerUrl,
       'document.getElementById("boss-filter-map").options.length > 0 && document.getElementById("boss-filter-roles").textContent.includes("Scourge")'), 5000));
-    const logging = await evaluate(main.webSocketDebuggerUrl, 'window.api.applyBossLogging()');
-    report.check('设置页 IPC 实际核验已就绪配置', logging.state === 'configured' && logging.ok === true);
+    report.check('客户端不再暴露配置写入 API 或配置状态', await evaluate(main.webSocketDebuggerUrl,
+      '(async () => !("applyBossLogging" in window.api) && !("bossLogging" in await window.api.getState()))()'));
     await evaluate(main.webSocketDebuggerUrl, 'document.getElementById("settings-close").click()');
-    report.check('设置界面含日志核验、长期保留说明与地图筛选', await evaluate(main.webSocketDebuggerUrl,
-      '!!document.getElementById("set-boss-apply") && !!document.getElementById("boss-filter-mode") && document.body.textContent.includes("不自动恢复")'));
-    fs.appendFileSync(appFile, line('Matching with group id: 19', 'application', '11'));
+    report.check('设置页保留地图筛选并说明只读日志，没有应用配置按钮', await evaluate(main.webSocketDebuggerUrl,
+      '!document.getElementById("set-boss-apply") && !!document.getElementById("boss-filter-mode") && document.body.textContent.includes("只读取现有日志")'));
+    appendLog(appFile, line('Matching with group id: 19', 'application', '11'));
     for (const [i, page] of pages.entries()) {
       const hidden = await waitFor(() => evaluate(page.webSocketDebuggerUrl, `(() => {
         const panel = document.getElementById('boss-panel') || document.getElementById('mini-boss-status');
         return !document.querySelector('.boss-log-marker') && panel.classList.contains('hidden');
       })()`), 5000);
-      report.check((i ? '悬浮地图' : '主地图') + '在线战局隐藏监控', hidden);
+      report.check((i ? '悬浮地图' : '主地图') + '在线 PvE 隐藏监控', hidden);
+    }
+    appendLog(appFile, line('Session mode: Pvp', 'application', '12'));
+    for (const [i, page] of pages.entries()) {
+      const hidden = await waitFor(() => evaluate(page.webSocketDebuggerUrl, `(async () => {
+        const panel = document.getElementById('boss-panel') || document.getElementById('mini-boss-status');
+        return (await window.api.getState()).bossMonitor.mode === 'online-pvp'
+          && !document.querySelector('.boss-log-marker') && panel.classList.contains('hidden');
+      })()`), 5000);
+      report.check((i ? '悬浮地图' : '主地图') + '在线 PvP 隐藏监控', hidden);
     }
   } finally {
-    if (app) { app.kill(); await sleep(500); }
+    if (app) {
+      let exited = false;
+      try {
+        if (main && app.alive) {
+          await evaluate(main.webSocketDebuggerUrl, 'setTimeout(() => window.close(), 100); true');
+          exited = await waitFor(async () => !app.alive, 30000);
+        }
+      } finally {
+        report.check('客户端正常关闭，无残留配置定时器异常', exited && !/ReferenceError|Uncaught Exception/i.test(app.tail(100)));
+        if (app.alive) { app.kill(); await sleep(500); }
+      }
+    }
+    if (expectedInputs) {
+      report.check('监控、设置与退出均不改写游戏配置或输入日志', [...expectedInputs]
+        .every(([file, content]) => fs.existsSync(file) && fs.readFileSync(file).equals(content)));
+      report.check('游戏目录没有产生备份、临时配置或其他文件',
+        JSON.stringify(fs.readdirSync(gameRoot).sort()) === JSON.stringify(['EscapeFromTarkov.exe', 'Logging.config']));
+    }
     prof.cleanup();
   }
 }
