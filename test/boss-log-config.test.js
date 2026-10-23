@@ -41,13 +41,13 @@ test('managed backups are outside user-writable app data and the elevated payloa
   const gameRoot = 'C:\\Games\\Escape from Tarkov';
   const files = loggingPaths(userData, gameRoot);
   assert.ok(!files.backup.toLowerCase().startsWith(userData.toLowerCase()));
-  assert.ok(files.restoreRequest.toLowerCase().startsWith(userData.toLowerCase()));
+  assert.ok(files.status.includes('persistent-status'));
   const scripts = buildElevatedScripts(gameRoot, userData, 1234);
   assert.ok(scripts.child.length <= 30000);
   assert.ok(scripts.parent.length < 8192);
 });
 
-test('elevated restore script passes the Windows PowerShell parser without running', {
+test('persistent elevated script passes the Windows PowerShell parser without running', {
   skip: process.platform !== 'win32',
 }, () => {
   const scripts = buildElevatedScripts('C:\\Games\\Escape from Tarkov', 'C:\\Users\\tester\\AppData\\Roaming\\TarkovOfflineMap', 1234);

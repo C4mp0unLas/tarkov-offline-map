@@ -14,7 +14,12 @@ const ROLE_NAMES = {
   bossKojaniy: 'Shturman', bossGluhar: 'Glukhar', bossSanitar: 'Sanitar',
   bossKnight: 'Knight', followerBigPipe: 'Big Pipe', followerBirdEye: 'Birdeye',
   bossZryachiy: 'Zryachiy', bossBoar: 'Kaban', bossKolontay: 'Kollontay',
-  bossPartisan: 'Partisan', sectantPriest: 'Cultist Priest',
+  bossPartisan: 'Partisan', sectantPriest: 'Cultist Priest', bossScourgeEventLab: 'Scourge',
+  exUsec: 'Rogue · 游荡者', pmcBot: 'Raider · 掠夺者',
+  followerScourgeEventLab: 'Scourge 随从', bossBullyBlackDiv: 'Reshala 随从',
+  bossBoarSniper: 'Kaban 狙击手', followerBoarClose1: 'Kaban 随从',
+  followerBoarClose2: 'Kaban 随从', sectantWarrior: 'Cultist 随从',
+  sectantOni: 'Oni', sectantPredvestnik: 'Harbinger', sectantPrizrak: 'Ghost',
   pmcBEAR: 'AI PMC · BEAR', pmcUSEC: 'AI PMC · USEC', shooterBTR: 'BTR',
   followerBully: 'Reshala 随从', followerBullyBlackDiv: 'Reshala 随从',
   followerKojaniy: 'Shturman 随从', followerGluharAssault: 'Glukhar 突击手',
@@ -26,7 +31,7 @@ const ROLE_NAMES = {
 
 function parseTimestamp(line, fallback) {
   const m = String(line || '').match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)/);
-  const value = m ? new Date(m[1].replace(' ', 'T')).getTime() : Number(fallback);
+  const value = m ? new Date(m[1].replace(' ', 'T')).getTime() : fallback == null ? NaN : Number(fallback);
   return Number.isFinite(value) ? value : null;
 }
 
@@ -62,6 +67,18 @@ function parseBossLogLine(line, meta = {}) {
     return { ...base, kind: 'scene-map', mapKey: canonicalMapKey(m[1]) };
   }
 
+  const gameTime = line.match(/GameDateTime:(\d{2})\/(\d{2})\/(\d{4}) (\d{2}):(\d{2}):(\d{2})\s+factor:([0-9.]+)/);
+  if (gameTime) {
+    const [, month, day, year, hour, minute, second, factor] = gameTime;
+    const value = new Date(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(second)).getTime();
+    if (Number.isFinite(value) && Number(factor) > 0) return { ...base, kind: 'game-time', gameTime: value, factor: Number(factor) };
+  }
+  const timer = line.match(/GameTimer utcNow:[^|]*?start:(\d{2}\/\d{2}\/\d{4} \d{2}:\d{2}:\d{2}) escape:(\d{2}\/\d{2}\/\d{4} \d{2}:\d{2}:\d{2})/);
+  if (timer) {
+    const duration = new Date(timer[2]).getTime() - new Date(timer[1]).getTime();
+    if (Number.isFinite(duration)) return { ...base, kind: 'raid-timer', duration: Math.max(0, duration) };
+  }
+
   if (line.includes('|aiData|')) {
     if ((m = line.match(/Init Boss wave:(\w+) ShallSpawn:(True|False)\b(?: BossChance:(\d+))?/i))) {
       return { ...base, kind: 'plan', role: m[1], planned: m[2].toLowerCase() === 'true', chance: m[3] == null ? null : Number(m[3]) };
@@ -89,10 +106,33 @@ function parseBossLogLine(line, meta = {}) {
   return null;
 }
 
+function canonicalRole(role) {
+  const value = String(role || '');
+  if (/^exUsecFree$/i.test(value)) return 'exUsec';
+  return Object.keys(ROLE_NAMES).find(key => key.toLowerCase() === value.toLowerCase()) || value;
+}
+
+function followerParent(role) {
+  const value = String(role || '');
+  if (/^(?:followerBully(?:BlackDiv)?|bossBullyBlackDiv)$/i.test(value)) return 'bossBully';
+  if (/^followerKojaniy$/i.test(value)) return 'bossKojaniy';
+  if (/^followerGluhar/i.test(value)) return 'bossGluhar';
+  if (/^followerSanitar$/i.test(value)) return 'bossSanitar';
+  if (/^followerZryachiy$/i.test(value)) return 'bossZryachiy';
+  if (/^(?:followerBoar.*|bossBoarSniper)$/i.test(value)) return 'bossBoar';
+  if (/^followerKolontay/i.test(value)) return 'bossKolontay';
+  if (/^followerTagilla$/i.test(value)) return 'bossTagilla';
+  if (/^followerScourgeEventLab$/i.test(value)) return 'bossScourgeEventLab';
+  if (/^sectant(?:Warrior|Oni|Predvestnik|Prizrak)$/i.test(value)) return 'sectantPriest';
+  return '';
+}
+
 function roleKind(role) {
   const value = String(role || '');
   if (/^pmc(?:bear|usec)$/i.test(value)) return 'pmc';
   if (/^shooterBTR$/i.test(value)) return 'btr';
+  if (/^(?:exUsec(?:Free)?|pmcBot)$/i.test(value)) return 'special';
+  if (followerParent(value)) return 'follower';
   if (/^follower(?:BigPipe|BirdEye)$/i.test(value)) return 'boss';
   if (/^follower/i.test(value)) return 'follower';
   if (/^boss/i.test(value) || /^sectantPriest$/i.test(value)) return 'boss';
@@ -164,7 +204,10 @@ function eventPriority(event) {
 function btrEstimate(raid, now, mapKey) {
   if (!raid.btr) return '等待 BTR 出现记录';
   if (raid.ended) return '战局已结束';
-  if (String(mapKey || '').toLowerCase() !== 'woods') return '已记录 BTR；路线推算仅支持森林';
+  if (String(mapKey || '').toLowerCase() !== 'woods') {
+    const signals = raid.btrReadyAt.filter(t => t >= raid.btr.time);
+    return signals.length ? `巡逻中 · 检测到 ${signals.length} 次发车信号 · 最后发车 ${new Date(Math.max(...signals)).toLocaleTimeString('zh-CN', { hourCycle: 'h23' })}` : '等待确认巡逻状态';
+  }
   const signals = raid.btrReadyAt.filter((t) => t >= raid.btr.time).sort((a, b) => a - b);
   if (!signals.length) {
     const elapsed = Math.max(0, (now - raid.btr.time) / 1000);
@@ -234,11 +277,14 @@ function summarizeRaid(events, now, fallbackMapKey = null) {
   let raid = { plans: new Map(), entities: [], zones: [], btrReadyAt: [], btrTaxiAt: [], startedAt: null, ended: false, btr: null, mapKey: null };
   const pendingDisposals = new Map();
   const activeProfiles = new Map();
-  for (const event of ordered) {
+  for (const original of ordered) {
+    const event = original.role ? { ...original, role: canonicalRole(original.role) } : original;
     if (event.kind === 'raid-map' || event.kind === 'scene-map') { raid.mapKey = event.mapKey || raid.mapKey; continue; }
     if (event.kind === 'raid-start') { raid.startedAt = event.time; continue; }
     if (event.kind === 'raid-end') { raid.ended = true; continue; }
     if (raid.ended) continue;
+    if (event.kind === 'game-time' && raid.gameTime == null) { raid.gameTime = event.gameTime; raid.factor = event.factor; continue; }
+    if (event.kind === 'raid-timer' && raid.duration == null) { raid.duration = event.duration; continue; }
     if (event.kind === 'plan') {
       if (roleKind(event.role) === 'pmc') {
         const current = raid.plans.get(event.role) || { role: event.role, waves: [] };
@@ -300,8 +346,9 @@ function summarizeRaid(events, now, fallbackMapKey = null) {
   }
   for (const entity of raid.entities) {
     if (entity.zone) continue;
-    const zone = raid.zones.filter((z) => z.role.toLowerCase() === entity.role.toLowerCase()
-      && z.botId && z.botId === entity.botId && Math.abs(z.time - entity.time) <= 5000)
+    const nextOccupant = ordered.find(e => e.kind === 'activate' && e.botId === entity.botId && e.time > entity.time && (e.profileId || String(e.time)) !== (entity.profileId || String(entity.time)));
+    const zone = raid.zones.filter(z => (!nextOccupant || z.time < nextOccupant.time)).filter((z) => canonicalRole(z.role).toLowerCase() === entity.role.toLowerCase()
+      && z.botId && z.botId === entity.botId)
       .sort((a, b) => Math.abs(a.time - entity.time) - Math.abs(b.time - entity.time))[0];
     if (zone) entity.zone = zone.zone;
   }
@@ -336,9 +383,16 @@ function summarizeRaid(events, now, fallbackMapKey = null) {
     additionalNotPlanned: r.waves.filter((w) => raid.startedAt != null && w.at >= raid.startedAt && !w.planned).length,
   }));
   const bosses = serializeRows('boss');
+  const cultist = bosses.find(row => row.role === 'sectantPriest' && row.status === 'planned');
+  if (cultist && raid.gameTime != null) {
+    const date = new Date(raid.gameTime);
+    const hour = date.getHours() + date.getMinutes() / 60 + date.getSeconds() / 3600;
+    const overlaps = hour >= 22 || hour < 7 || (raid.duration != null && raid.duration * (raid.factor || 7) >= (22 - hour) * 3600000);
+    if (!overlaps) { cultist.status = 'not-planned'; cultist.condition = '战局时间未覆盖 Cultist 活动时段（22:00–07:00）'; }
+  }
   const followers = serializeRows('follower');
   return {
-    bosses, followers, pmcs,
+    bosses, followers, pmcs, specialAis: serializeRows('special'), mapKey: raid.mapKey, ended: raid.ended,
     markers: raid.entities.filter((e) => e.kind === 'boss' && e.position && e.mapKey).map((e) => ({
       id: `${e.role}:${e.profileId || e.time}`, role: e.role, name: e.name, ...e.position,
       at: e.time, life: e.life, zone: e.zone, mapKey: e.mapKey,
@@ -395,12 +449,12 @@ class BossMonitor {
     const canonical = [...this.files].some((f) => /(?:^|[\\/ ])aiData_\d+\.log$/i.test(f))
       && [...this.files].some((f) => /(?:^|[\\/ ])application_\d+\.log$/i.test(f));
     const events = canonical ? this.events.filter((e) => !/output(?:_log)?(?:_\d+)?\.log$/i.test(e.file)
-      || ['btr-ready', 'btr-taxi'].includes(e.kind)) : this.events;
+      || ['btr-ready', 'btr-taxi', 'game-time', 'raid-timer'].includes(e.kind)) : this.events;
     const classified = classifyMode(events);
     if (this.overflow) {
       return {
         mode: 'recognizing', reason: '日志量超出安全处理上限，等待新游戏会话重新识别', session: this.session,
-        markers: [], bosses: [], followers: [], pmcs: [], btr: null,
+        markers: [], bosses: [], followers: [], pmcs: [], specialAis: [], btr: null,
         updatedAt: this.events.reduce((latest, event) => Math.max(latest, event.time), 0) || null,
       };
     }
@@ -409,7 +463,7 @@ class BossMonitor {
         mode: classified.mode,
         reason: classified.reason,
         session: this.session,
-        markers: [], bosses: [], followers: [], pmcs: [],
+        markers: [], bosses: [], followers: [], pmcs: [], specialAis: [],
         btr: null,
         updatedAt: this.events.reduce((latest, event) => Math.max(latest, event.time), 0) || null,
       };
@@ -423,4 +477,4 @@ class BossMonitor {
   }
 }
 
-module.exports = { BossMonitor, parseBossLogLine, parsePosition, classifyMode, summarizeRaid, btrEstimate, ROLE_NAMES };
+module.exports = { BossMonitor, parseBossLogLine, parsePosition, classifyMode, summarizeRaid, btrEstimate, ROLE_NAMES, canonicalRole, followerParent, roleKind };

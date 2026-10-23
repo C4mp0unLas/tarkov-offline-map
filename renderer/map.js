@@ -111,6 +111,20 @@ async function init() {
   $('#set-shots-open').addEventListener('click', () => openDir($('#set-shots').value.trim()));
   $('#set-game-path-pick').addEventListener('click', () => pickDirInto('#set-game-path', '选择 Escape from Tarkov 游戏目录'));
   $('#set-game-path-open').addEventListener('click', () => openDir($('#set-game-path').value.trim()));
+  $('#set-boss-apply').addEventListener('click', async () => {
+    const button = $('#set-boss-apply'); button.disabled = true;
+    $('#set-boss-config-state').textContent = '正在请求管理员权限并核验配置…';
+    try { const result = await api.applyBossLogging(); $('#set-boss-config-state').textContent = result.message || result.state; }
+    catch (error) { $('#set-boss-config-state').textContent = '配置未完成：' + error.message; }
+    finally { button.disabled = false; }
+  });
+  $('#set-boss-discover').addEventListener('click', async () => {
+    try { const result = await api.discoverGame(); $('#set-game-path').value = result.gamePath || ''; $('#set-boss-config-state').textContent = result.gamePath ? '已找到游戏目录，可应用日志设置' : '未自动找到，请选择游戏目录'; }
+    catch (error) { $('#set-boss-config-state').textContent = error.message; }
+  });
+  $('#boss-filter-map').addEventListener('input', renderBossFilterRoles);
+  $('#boss-filter-mode').addEventListener('input', saveBossMapFilter);
+  $('#boss-filter-roles').addEventListener('change', saveBossMapFilter);
   $('#btn-settings').addEventListener('click', openSettings);
 $('#btn-library').addEventListener('click', () => api.openLibrary({}));
   // 自动截图的键名捕获：点按钮 -> 在输入框里按下你要用的键（拿 e.code，和主进程那套键名一致）
@@ -382,12 +396,50 @@ async function openDir(p) {
   if (res && res.error) alert(res.error);
 }
 
+const bossRoleLabels = { bossKilla: 'Killa', bossTagilla: 'Tagilla', bossBully: 'Reshala', bossKojaniy: 'Shturman', bossGluhar: 'Glukhar', bossSanitar: 'Sanitar', bossKnight: 'Knight', followerBigPipe: 'Big Pipe', followerBirdEye: 'Birdeye', bossZryachiy: 'Zryachiy', bossBoar: 'Kaban', bossKolontay: 'Kollontay', bossPartisan: 'Partisan', sectantPriest: 'Cultist Priest', bossScourgeEventLab: 'Scourge' };
+async function initBossMapFilters() {
+  const select = $('#boss-filter-map');
+  const old = select.value;
+  const maps = await api.listMaps();
+  select.replaceChildren();
+  const seen = new Set();
+  for (const map of maps) {
+    if (seen.has(map.key)) continue; seen.add(map.key);
+    const option = document.createElement('option'); option.value = map.key; option.textContent = map.name; select.appendChild(option);
+  }
+  select.value = seen.has(old) ? old : state.detail?.key || 'the-lab';
+  renderBossFilterRoles();
+}
+function renderBossFilterRoles() {
+  const key = $('#boss-filter-map').value;
+  const filter = state.cfg.bossMapFilters?.[key] || { mode: 'all', roles: [] };
+  $('#boss-filter-mode').value = filter.mode;
+  const roles = { ...bossRoleLabels };
+  for (const row of latestBossMonitor?.bosses || []) roles[row.role] = row.name;
+  for (const role of filter.roles) if (!roles[role]) roles[role] = role;
+  const container = $('#boss-filter-roles'); container.replaceChildren();
+  for (const [role, name] of Object.entries(roles)) {
+    const label = document.createElement('label'); const input = document.createElement('input');
+    input.type = 'checkbox'; input.value = role; input.checked = filter.roles.includes(role); input.disabled = filter.mode !== 'selected';
+    label.append(input, document.createTextNode(name)); container.appendChild(label);
+  }
+}
+async function saveBossMapFilter() {
+  const key = $('#boss-filter-map').value;
+  const filter = { mode: $('#boss-filter-mode').value, roles: [...$('#boss-filter-roles').querySelectorAll('input:checked')].map(input => input.value) };
+  state.cfg.bossMapFilters = { ...state.cfg.bossMapFilters, [key]: filter };
+  try { await api.setConfig({ bossMapFilters: { [key]: filter } }); renderBossFilterRoles(); }
+  catch (error) { $('#set-boss-config-state').textContent = '筛选未保存：' + error.message; }
+}
+
 function openSettings() {
   const c = state.cfg;
   $('#set-logs').value = c.logsPath || '';
   $('#set-shots').value = c.screenshotsPath || '';
   $('#set-game-path').value = c.gamePath || '';
-  $('#set-boss-config-state').textContent = '';
+  $('#set-boss-config-state').textContent = state.bossLogging?.message || '点击应用并核验日志设置；配置长期保留';
+  $('#set-boss-notifications').checked = c.bossNotifications !== false;
+  initBossMapFilters();
   $('#set-boss-monitor').checked = c.bossMonitorEnabled !== false;
   $('#set-auto-zoom').checked = c.autoZoom !== false;
   $('#set-auto-center').checked = c.autoCenter !== false;
@@ -756,8 +808,9 @@ function renderBossPanel(monitor) {
   }
 
   const mapKey = state.detail && state.detail.key;
-  const relevant = (row) => (row.entities || []).some((e) => e.mapKey === mapKey)
+  const relevant = (row) => (!(row.entities || []).length && !(row.waves || []).length && monitor.mapKey === mapKey) || (row.entities || []).some((e) => e.mapKey === mapKey)
     || (row.waves || []).some((wave) => wave.mapKey === mapKey);
+  if (monitor.filterMode === 'off' && monitor.mapKey === mapKey) body.appendChild(bossRow('首领', '本图首领监控已关闭'));
   const bossRows = [...(monitor.bosses || []), ...(monitor.followers || [])].filter(relevant);
   for (const row of bossRows) {
     let value;
@@ -774,11 +827,21 @@ function renderBossPanel(monitor) {
     else if (row.status === 'planned') value = `计划刷新${row.chance == null ? '' : ` · 概率 ${row.chance}%`}`;
     else if (row.status === 'not-planned') value = '本波未计划刷新';
     else value = '等待刷新记录';
+    if (row.condition) value += '；' + row.condition;
     body.appendChild(bossRow(row.name, value));
   }
   for (const row of (monitor.pmcs || []).filter(relevant)) {
     body.appendChild(bossRow(row.name,
       `初始计划 ${row.initialPlanned} / ${row.initialNotPlanned} 未计划 · 已记录出现 ${row.spawned}${row.entities.length ? ` · ${bossLifeSummary(row.entities)}` : ''} · 后续计划 ${row.additionalPlanned} / ${row.additionalNotPlanned} 未计划`));
+  }
+  if (monitor.mapKey === mapKey) {
+    for (const [role, name] of [['exUsec', 'Rogue · 游荡者'], ['pmcBot', 'Raider · 掠夺者']]) {
+      const row = (monitor.specialAis || []).find(item => item.role === role);
+      const first = row?.entities?.[0];
+      const detail = first ? ' · 首次激活 ' + bossDeathTime(first.time) + (first.zone ? ' · 初始区域 ' + first.zone : '') + (first.position ? ' · 初始 (' + first.position.x.toFixed(1) + ', ' + first.position.y.toFixed(1) + ', ' + first.position.z.toFixed(1) + ')' : '') : '';
+      body.appendChild(bossRow(name, first ? '实际激活 ' + row.entities.length + ' · ' + bossLifeSummary(row.entities) + detail : '未检测到刷新'));
+    }
+    if (monitor.btr?.status !== 'confirmed') body.appendChild(bossRow('BTR', '未检测到刷新'));
   }
   if (monitor.btr && monitor.btr.status === 'confirmed' && monitor.btr.mapKey === mapKey) {
     const pos = monitor.btr.position ? ` · 初始 (${monitor.btr.position.x.toFixed(1)}, ${monitor.btr.position.z.toFixed(1)})` : '';
@@ -796,6 +859,7 @@ function renderBossPanel(monitor) {
 async function applyMainState(s) {
   if (!s) return;
   const revision = ++mainStateRevision;
+  if (s.bossLogging) { state.bossLogging = s.bossLogging; $('#set-boss-config-state').textContent = s.bossLogging.message || s.bossLogging.state; }
   latestBossMonitor = s.bossMonitor || null;
   renderBossPanel(latestBossMonitor);
   const wantedId = s.mapId;

@@ -1,4 +1,4 @@
-Boss Monitor functionality in this project is adapted from Tarkov Boss Monitor.
+Boss Monitor functionality in this project is adapted from Tarkov Boss Monitor 1.0.16 (https://github.com/seongjin-lab/tarkov-boss).
 
 Copyright (c) 2026 seongjin-lab
 

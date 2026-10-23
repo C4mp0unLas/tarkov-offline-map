@@ -1,273 +1,144 @@
 'use strict';
-
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { execFile } = require('child_process');
-
 const DESIRED_LEVELS = { aiData: 'Trace', application: 'Debug', backend: 'Information' };
 const LEVELS = ['Trace', 'Debug', 'Information', 'Warning', 'Error', 'Critical'];
-
 function planLoggingConfig(raw) {
-  const hasBom = raw.charCodeAt(0) === 0xFEFF;
-  const config = JSON.parse(hasBom ? raw.slice(1) : raw);
+  const bom = raw.charCodeAt(0) === 0xFEFF;
+  const config = JSON.parse(bom ? raw.slice(1) : raw);
   if (!config || !Array.isArray(config.rules)) throw new Error('Logging.config 缺少 rules 数组');
-  const result = JSON.parse(JSON.stringify(config));
   let changed = false;
   for (const [name, desired] of Object.entries(DESIRED_LEVELS)) {
-    const matches = result.rules.filter((rule) => rule && rule.fileName === name);
+    const matches = config.rules.filter(rule => rule && rule.fileName === name);
     if (matches.length !== 1) throw new Error(`Logging.config 中 ${name} 规则数量不是 1`);
     if (!LEVELS.includes(matches[0].minLevel)) throw new Error(`Logging.config 中 ${name} 日志级别无效`);
-    if (LEVELS.indexOf(matches[0].minLevel) > LEVELS.indexOf(desired)) {
-      matches[0].minLevel = desired;
-      changed = true;
-    }
+    if (LEVELS.indexOf(matches[0].minLevel) > LEVELS.indexOf(desired)) { matches[0].minLevel = desired; changed = true; }
   }
-  return { changed, output: changed ? `${hasBom ? '\uFEFF' : ''}${JSON.stringify(result, null, 2)}` : raw };
+  return { changed, output: changed ? `${bom ? '\uFEFF' : ''}${JSON.stringify(config, null, 2)}\n` : raw };
 }
-
-function sha256(value) {
-  return crypto.createHash('sha256').update(value).digest('hex').toUpperCase();
-}
-
+function sha256(value) { return crypto.createHash('sha256').update(value).digest('hex').toUpperCase(); }
 function loggingPaths(userData, gameRoot = '') {
-  const id = gameRoot ? sha256(path.resolve(gameRoot).toLowerCase()).slice(0, 16) : 'default';
+  const id = sha256(path.resolve(gameRoot).toLowerCase()).slice(0, 16);
   const secureRoot = path.join(process.env.ProgramData || path.join(path.parse(userData).root, 'ProgramData'), 'TarkovOfflineMapBoss');
-  const secureBase = path.join(secureRoot, `boss-logging-${id}`);
-  const userBase = path.join(userData, `boss-logging-${id}`);
-  return {
-    secureRoot,
-    backup: `${secureBase}.backup`,
-    backupHash: `${secureBase}.backup.sha256`,
-    appliedHash: `${secureBase}.applied.sha256`,
-    metadata: `${secureBase}.json`,
-    restoreRequest: `${userBase}.restore-request`,
-    conflict: `${secureBase}.restore-conflict`,
-    status: `${secureBase}.status`,
-  };
+  const base = path.join(secureRoot, `boss-logging-${id}`);
+  return { secureRoot, backup: base + '.backup', status: base + '.persistent-status.json' };
 }
-
-function buildElevatedScripts(gameRoot, userData, ownerPid = process.pid) {
-  const files = loggingPaths(userData, gameRoot);
-  const payload = Buffer.from(JSON.stringify({ gameRoot, userData, ownerPid, files }), 'utf8').toString('base64');
+function buildElevatedScripts(gameRoot, userData, requestId = crypto.randomUUID()) {
+  const payload = Buffer.from(JSON.stringify({ gameRoot, files: loggingPaths(userData, gameRoot), requestId })).toString('base64');
   const child = String.raw`
 $ErrorActionPreference = 'Stop'
 $ctx = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__PAYLOAD__')) | ConvertFrom-Json
 $utf8 = [Text.UTF8Encoding]::new($false)
 $root = [IO.Path]::GetFullPath([string]$ctx.gameRoot).TrimEnd('\')
 $config = Join-Path $root 'Logging.config'
-$exe = Join-Path $root 'EscapeFromTarkov.exe'
-$backup = [string]$ctx.files.backup
-$backupHashFile = [string]$ctx.files.backupHash
-$appliedHashFile = [string]$ctx.files.appliedHash
-$metadataFile = [string]$ctx.files.metadata
-$restoreRequest = [string]$ctx.files.restoreRequest
-$conflictFile = [string]$ctx.files.conflict
-$statusFile = [string]$ctx.files.status
-$secureRoot = [IO.Path]::GetFullPath([string]$ctx.files.secureRoot)
-$userData = [IO.Path]::GetFullPath([string]$ctx.userData)
-$ownerPid = [int]$ctx.ownerPid
-$ownerStart = 0L
-try { $ownerStart = (Get-Process -Id $ownerPid -ErrorAction Stop).StartTime.ToUniversalTime().Ticks } catch {}
-
-function Write-State([string]$value) {
-  try { [IO.File]::WriteAllText($statusFile, $value, $utf8) } catch {}
-}
-function Test-NoReparsePath([string]$pathValue) {
-  $current = [IO.Path]::GetFullPath($pathValue)
+$secureRoot = [string]$ctx.files.secureRoot
+function Reject-Links([string]$value) {
+  $current = [IO.Path]::GetFullPath($value)
   while ($current) {
     if (Test-Path -LiteralPath $current) {
-      $item = Get-Item -LiteralPath $current -Force
-      if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw '目标路径包含链接或重解析点' }
+      if (((Get-Item -LiteralPath $current -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw '目标路径包含链接或重解析点' }
     }
-    $parentInfo = [IO.Directory]::GetParent($current)
-    $parent = if ($parentInfo) { $parentInfo.FullName } else { $null }
-    if (-not $parent -or $parent -eq $current) { break }
-    $current = $parent
+    $parent = [IO.Directory]::GetParent($current)
+    if (-not $parent) { break }; $current = $parent.FullName
   }
 }
-function Test-GameRunning {
-  return @((Get-Process -Name 'EscapeFromTarkov' -ErrorAction SilentlyContinue)).Count -gt 0
+function Write-State([string]$state, [string]$message = '') {
+  $value = @{ requestId = [string]$ctx.requestId; state = $state; message = $message; gameRoot = $root } | ConvertTo-Json -Compress
+  [IO.File]::WriteAllText([string]$ctx.files.status, $value, $utf8)
 }
-function Test-OwnerRunning {
-  if ($ownerStart -eq 0) { return $false }
-  try {
-    $p = Get-Process -Id $ownerPid -ErrorAction Stop
-    return $p.StartTime.ToUniversalTime().Ticks -eq $ownerStart
-  } catch { return $false }
-}
-function Restore-ManagedConfig {
-  if (-not (Test-Path -LiteralPath $backup -PathType Leaf)) { return $true }
-  Test-NoReparsePath $root
-  Test-NoReparsePath $config
-  Test-NoReparsePath $secureRoot
-  if ((Test-Path -LiteralPath $backupHashFile -PathType Leaf) -and
-      (Get-FileHash -LiteralPath $backup -Algorithm SHA256).Hash -eq ([IO.File]::ReadAllText($backupHashFile)).Trim() -and
-      (Get-FileHash -LiteralPath $config -Algorithm SHA256).Hash -eq ([IO.File]::ReadAllText($backupHashFile)).Trim()) {
-    Remove-Item -LiteralPath $backup, $backupHashFile, $appliedHashFile, $metadataFile, $restoreRequest -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $conflictFile -Force -ErrorAction SilentlyContinue
-    Write-State 'restored'
-    return $true
-  }
-  if (-not (Test-Path -LiteralPath $backupHashFile -PathType Leaf) -or -not (Test-Path -LiteralPath $appliedHashFile -PathType Leaf) -or -not (Test-Path -LiteralPath $metadataFile -PathType Leaf)) {
-    [IO.File]::WriteAllText($conflictFile, '配置备份信息不完整；已保留备份并停止自动恢复。', $utf8)
-    Write-State 'conflict'
-    return $false
-  }
-  $metadata = [IO.File]::ReadAllText($metadataFile) | ConvertFrom-Json
-  if ([IO.Path]::GetFullPath([string]$metadata.gameRoot).TrimEnd('\') -ne $root) {
-    [IO.File]::WriteAllText($conflictFile, '备份对应的游戏目录不匹配；已保留备份并停止自动恢复。', $utf8)
-    Write-State 'conflict'
-    return $false
-  }
-  $expected = ([IO.File]::ReadAllText($appliedHashFile)).Trim()
-  $expectedBackup = ([IO.File]::ReadAllText($backupHashFile)).Trim()
-  if ((Get-FileHash -LiteralPath $config -Algorithm SHA256).Hash -ne $expected -or (Get-FileHash -LiteralPath $backup -Algorithm SHA256).Hash -ne $expectedBackup) {
-    [IO.File]::WriteAllText($conflictFile, 'Logging.config 或备份已被其他程序修改；已保留现场并跳过自动恢复。', $utf8)
-    Write-State 'conflict'
-    return $false
-  }
-  $temp = $config + '.boss-monitor.restore.tmp'
-  [IO.File]::Copy($backup, $temp, $true)
-  Move-Item -LiteralPath $temp -Destination $config -Force
-  Remove-Item -LiteralPath $backup, $backupHashFile, $appliedHashFile, $metadataFile, $restoreRequest -Force -ErrorAction SilentlyContinue
-  Remove-Item -LiteralPath $conflictFile -Force -ErrorAction SilentlyContinue
-  Write-State 'restored'
-  return $true
-}
-function Apply-ManagedConfig {
-  Test-NoReparsePath $root
-  Test-NoReparsePath $config
-  Test-NoReparsePath $secureRoot
-  $raw = [IO.File]::ReadAllText($config)
+function Game-Running { return @(Get-Process -Name 'EscapeFromTarkov' -ErrorAction SilentlyContinue).Count -gt 0 }
+function Plan-Config([string]$raw) {
   $settings = $raw | ConvertFrom-Json
   if (-not ($settings.rules -is [array])) { throw 'Logging.config 缺少 rules 数组' }
-  $levels = @('Trace', 'Debug', 'Information', 'Warning', 'Error', 'Critical')
+  $levels = @('Trace','Debug','Information','Warning','Error','Critical')
   $desired = @{ aiData = 'Trace'; application = 'Debug'; backend = 'Information' }
   $changed = $false
-  foreach ($name in @('aiData', 'application', 'backend')) {
+  foreach ($name in @('aiData','application','backend')) {
     $matches = @($settings.rules | Where-Object { $_.fileName -ceq $name })
-    if ($matches.Count -ne 1) { throw "Logging.config 中 $name 规则数量不是 1" }
+    if ($matches.Count -ne 1) { throw ('日志规则缺失或重复: ' + $name) }
     $index = [Array]::IndexOf($levels, [string]$matches[0].minLevel)
-    if ($index -lt 0) { throw "Logging.config 中 $name 日志级别无效" }
+    if ($index -lt 0) { throw ('日志级别无效: ' + $name) }
     if ($index -gt [Array]::IndexOf($levels, $desired[$name])) { $matches[0].minLevel = $desired[$name]; $changed = $true }
   }
-  if (-not $changed) { Write-State 'already-configured'; return $false }
-  if (Test-GameRunning) { throw '游戏进程仍在运行，延后配置修改' }
-  [IO.Directory]::CreateDirectory($secureRoot) | Out-Null
-  $acl = New-Object System.Security.AccessControl.DirectorySecurity
-  $acl.SetAccessRuleProtection($true, $false)
-  $acl.SetOwner([System.Security.Principal.NTAccount]::new('BUILTIN\Administrators'))
-  foreach ($principal in @('BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM')) {
-    $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($principal, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
-    $acl.AddAccessRule($rule)
-  }
-  $readRule = [System.Security.AccessControl.FileSystemAccessRule]::new('BUILTIN\Users', 'ReadAndExecute', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
-  $acl.AddAccessRule($readRule)
-  Set-Acl -LiteralPath $secureRoot -AclObject $acl
-  [IO.File]::Copy($config, $backup, $false)
-  [IO.File]::WriteAllText($backupHashFile, (Get-FileHash -LiteralPath $backup -Algorithm SHA256).Hash, $utf8)
-  [IO.File]::WriteAllText($metadataFile, (@{ gameRoot = $root } | ConvertTo-Json -Compress), $utf8)
-  $temp = $config + '.boss-monitor.tmp'
-  [IO.File]::WriteAllText($temp, (($settings | ConvertTo-Json -Depth 100) + [Environment]::NewLine), $utf8)
-  if (Test-GameRunning) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue; throw '游戏进程已启动，延后配置修改' }
-  Test-NoReparsePath $config
-  $plannedHash = (Get-FileHash -LiteralPath $temp -Algorithm SHA256).Hash
-  [IO.File]::WriteAllText($appliedHashFile, $plannedHash, $utf8)
-  [IO.File]::Replace($temp, $config, $null)
-  Remove-Item -LiteralPath $conflictFile -Force -ErrorAction SilentlyContinue
-  Write-State 'configured-after-game-exit'
-  return $true
+  return @{ Changed = $changed; Settings = $settings }
 }
-
 try {
-  if (-not (Test-Path -LiteralPath $exe -PathType Leaf) -or -not (Test-Path -LiteralPath $config -PathType Leaf)) { throw '游戏目录无效或缺少 Logging.config' }
-  [IO.Directory]::CreateDirectory($userData) | Out-Null
-  Test-NoReparsePath $root
-  Test-NoReparsePath $config
-  Test-NoReparsePath $userData
-  Test-NoReparsePath $secureRoot
-  $mutexName = 'Global\TarkovOfflineMapBoss_' + ([IO.Path]::GetFileNameWithoutExtension($backup) -replace '[^A-Za-z0-9_]', '_')
-  $mutex = New-Object System.Threading.Mutex($false, $mutexName)
-  $hasMutex = $false
-  try { $hasMutex = $mutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $hasMutex = $true }
-  if (-not $hasMutex) { Write-State 'already-managed'; exit 0 }
-  if (-not (Test-OwnerRunning) -and -not (Test-Path -LiteralPath $restoreRequest)) { Write-State 'cancelled'; exit 0 }
-
-  while ($true) {
-    if (Test-GameRunning) {
-      Write-State 'waiting-game-exit'
-      Start-Sleep -Seconds 3
-      continue
-    }
-    if ((Test-Path -LiteralPath $restoreRequest) -or -not (Test-OwnerRunning)) {
-      if (Test-Path -LiteralPath $backup) { [void](Restore-ManagedConfig) } else { Write-State 'cancelled' }
-      break
-    }
-    if (-not (Test-Path -LiteralPath $backup)) {
-      Start-Sleep -Seconds 2
-      if (Test-GameRunning) { continue }
-      if (-not (Test-OwnerRunning) -or (Test-Path -LiteralPath $restoreRequest)) { Write-State 'cancelled'; break }
-      if (-not (Apply-ManagedConfig)) { break }
-    } else {
-      $metadata = [IO.File]::ReadAllText($metadataFile) | ConvertFrom-Json
-      $expected = ([IO.File]::ReadAllText($appliedHashFile)).Trim()
-      if ([IO.Path]::GetFullPath([string]$metadata.gameRoot).TrimEnd('\') -ne $root -or (Get-FileHash -LiteralPath $config -Algorithm SHA256).Hash -ne $expected) {
-        [IO.File]::WriteAllText($conflictFile, 'Logging.config 已被其他程序修改；保留备份，跳过后续恢复。', $utf8)
-        Write-State 'conflict'
-        break
-      }
-      Write-State 'managed'
-    }
-    Start-Sleep -Seconds 3
+  Reject-Links $root; Reject-Links $config; Reject-Links $secureRoot
+  if ($root.StartsWith('\\') -or -not (Test-Path -LiteralPath (Join-Path $root 'EscapeFromTarkov.exe') -PathType Leaf)) { throw '游戏目录无效' }
+  [IO.Directory]::CreateDirectory($secureRoot) | Out-Null
+  $admins = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+  $system = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+  $users = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')
+  $acl = [Security.AccessControl.DirectorySecurity]::new()
+  $acl.SetAccessRuleProtection($true, $false); $acl.SetOwner($admins)
+  foreach ($sid in @($admins, $system)) { $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow')) }
+  $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($users,'ReadAndExecute','ContainerInherit,ObjectInherit','None','Allow'))
+  Set-Acl -LiteralPath $secureRoot -AclObject $acl
+  $mutex = [Threading.Mutex]::new($false, 'Global\TarkovOfflineMapPersistentLogging')
+  $held = $false
+  try { $held = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $held = $true }
+  if (-not $held) { throw '另一项日志配置操作正在进行，请稍后重试' }
+  while (Game-Running) { Write-State 'waiting-game-exit' '游戏退出后应用；当前尚未写入'; Start-Sleep -Seconds 3 }
+  Reject-Links $config
+  $before = [IO.File]::ReadAllBytes($config)
+  $beforeHash = (Get-FileHash -LiteralPath $config -Algorithm SHA256).Hash
+  $plan = Plan-Config ([IO.File]::ReadAllText($config))
+  if ($plan.Changed) {
+    $backup = [string]$ctx.files.backup + '.' + $beforeHash + '.bak'
+    Reject-Links $backup
+    if (-not (Test-Path -LiteralPath $backup)) { [IO.File]::WriteAllBytes($backup, $before) }
+    if ((Get-FileHash -LiteralPath $backup -Algorithm SHA256).Hash -ne $beforeHash) { throw '配置备份校验失败' }
+    $temp = $config + '.boss-' + [string]$ctx.requestId + '.tmp'
+    $rollback = $config + '.boss-' + [string]$ctx.requestId + '.bak'
+    Reject-Links $temp; Reject-Links $rollback
+    [IO.File]::WriteAllText($temp, (($plan.Settings | ConvertTo-Json -Depth 100) + [Environment]::NewLine), $utf8)
+    if (Game-Running) { throw '游戏已启动，尚未写入配置；退出后请重试' }
+    if ((Get-FileHash -LiteralPath $config -Algorithm SHA256).Hash -ne $beforeHash) { throw '配置被其他程序修改，请重试' }
+    $expected = (Get-FileHash -LiteralPath $temp -Algorithm SHA256).Hash
+    # Windows PowerShell 5.1 converts null string arguments to an empty path.
+    # Supply a real rollback path rather than File.Replace(..., $null).
+    [IO.File]::Replace($temp, $config, $rollback)
+    if ((Get-FileHash -LiteralPath $config -Algorithm SHA256).Hash -ne $expected) { throw '写入后的配置哈希不匹配' }
   }
+  if ((Plan-Config ([IO.File]::ReadAllText($config))).Changed) { throw '写入后的日志级别不符合要求' }
+  Write-State 'configured' '已重新读取并核验 aiData / application / backend；设置长期保留'
 } catch {
-  Write-State ('error: ' + $_.Exception.Message)
+  try { Write-State 'error' $_.Exception.Message } catch {}
+  exit 1
+} finally {
+  if ($held) { $mutex.ReleaseMutex() }; if ($mutex) { $mutex.Dispose() }
+  if ($temp -and (Test-Path -LiteralPath $temp)) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue }
 }
 `;
-  const childCommand = child.replace('__PAYLOAD__', payload);
-  const childEncoded = Buffer.from(childCommand, 'utf16le').toString('base64');
-  if (childEncoded.length > 30000) throw new Error('管理员守护脚本超过 Windows 环境变量长度限制');
-  const parent = "$child=$env:TARKOV_BOSS_MONITOR_CHILD; if ([string]::IsNullOrEmpty($child) -or $child.Length -gt 30000) { exit 87 }; try { Start-Process -FilePath 'powershell.exe' -Verb RunAs -WindowStyle Hidden -ArgumentList @('-NoProfile','-NonInteractive','-EncodedCommand',$child) | Out-Null; exit 0 } catch { exit 1223 }";
-  return { parent: Buffer.from(parent, 'utf16le').toString('base64'), child: childEncoded };
+  const childEncoded = Buffer.from(child.replace('__PAYLOAD__', payload), 'utf16le').toString('base64');
+  if (childEncoded.length > 30000) throw new Error('日志配置脚本超过 Windows 长度限制');
+  const parent = "try { Start-Process -FilePath 'powershell.exe' -Verb RunAs -WindowStyle Hidden -ArgumentList @('-NoProfile','-NonInteractive','-EncodedCommand',$env:TARKOV_BOSS_MONITOR_CHILD) -ErrorAction Stop | Out-Null; exit 0 } catch { Write-Error $_.Exception.Message; exit 1 }";
+  return { parent: Buffer.from(parent, 'utf16le').toString('base64'), child: childEncoded, requestId };
 }
-
-function buildElevatedCommand(gameRoot, userData, ownerPid = process.pid) {
-  return buildElevatedScripts(gameRoot, userData, ownerPid).parent;
+function readStatus(userData, gameRoot) {
+  try { return JSON.parse(fs.readFileSync(loggingPaths(userData, gameRoot).status, 'utf8')); } catch { return null; }
 }
-
-function runElevated(gameRoot, userData, ownerPid) {
-  return new Promise((resolve, reject) => {
-    let scripts;
-    try { scripts = buildElevatedScripts(gameRoot, userData, ownerPid); } catch (error) { reject(error); return; }
-    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', scripts.parent], {
-      windowsHide: true, timeout: 120000, maxBuffer: 1024 * 1024,
-      env: { ...process.env, TARKOV_BOSS_MONITOR_CHILD: scripts.child },
-    }, (error, stdout, stderr) => {
-      if (error) {
-        const detail = (stderr || stdout || error.message || '').trim();
-        reject(new Error(detail || '管理员授权未完成'));
-      } else resolve({ stdout, stderr });
-    });
-  });
+async function runElevated(gameRoot, userData, { onStatus = () => {} } = {}) {
+  const scripts = buildElevatedScripts(gameRoot, userData);
+  await new Promise((resolve, reject) => execFile('powershell.exe', ['-NoProfile','-NonInteractive','-EncodedCommand',scripts.parent],
+    { windowsHide: true, timeout: 120000, env: { ...process.env, TARKOV_BOSS_MONITOR_CHILD: scripts.child } },
+    (error, stdout, stderr) => error ? reject(new Error((stderr || error.message).trim())) : resolve()));
+  const deadline = Date.now() + 20000;
+  while (Date.now() < deadline) {
+    const status = readStatus(userData, gameRoot);
+    if (status?.requestId === scripts.requestId) {
+      onStatus(status);
+      if (status.state === 'error') throw new Error(status.message);
+      if (status.state === 'configured') {
+        if (planLoggingConfig(fs.readFileSync(path.join(gameRoot, 'Logging.config'), 'utf8')).changed) throw new Error('配置写入核验失败');
+        return status;
+      }
+      if (status.state === 'waiting-game-exit') return status;
+    }
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
+  throw new Error('未收到配置助手的有效结果，未确认写入成功；请查看权限或重试');
 }
-
-function hasManagedBackup(userData, gameRoot) {
-  return fs.existsSync(loggingPaths(userData, gameRoot).backup);
-}
-
-function requestRestore(userData, gameRoot) {
-  const files = loggingPaths(userData, gameRoot);
-  fs.mkdirSync(userData, { recursive: true });
-  if (!fs.existsSync(files.restoreRequest)) fs.writeFileSync(files.restoreRequest, String(Date.now()));
-  return true;
-}
-
-function resumeManagedConfig(userData, gameRoot) {
-  try { fs.unlinkSync(loggingPaths(userData, gameRoot).restoreRequest); } catch {}
-}
-
-module.exports = {
-  DESIRED_LEVELS, planLoggingConfig, sha256, loggingPaths,
-  buildElevatedCommand, buildElevatedScripts, runElevated, hasManagedBackup, requestRestore, resumeManagedConfig,
-};
+module.exports = { DESIRED_LEVELS, planLoggingConfig, sha256, loggingPaths, buildElevatedScripts, readStatus, runElevated };

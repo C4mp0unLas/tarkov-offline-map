@@ -194,10 +194,19 @@
             <button type="button" id="set-game-path-pick" title="选择包含 EscapeFromTarkov.exe 的目录">选择游戏目录…</button>
             <button type="button" id="set-game-path-open" title="在资源管理器里打开游戏目录">打开文件夹</button>
           </div>
+          <div class="dir-row"><button type="button" id="set-boss-discover">自动查找游戏目录</button><button type="button" id="set-boss-apply">应用并核验日志设置</button></div>
           <label class="row"><input type="checkbox" id="set-boss-monitor" /> 启用本地 PvE 首领监控</label>
           <div class="hint" id="set-boss-config-state" role="status" aria-live="polite"></div>
           <div class="hint">日志目录用来识别进图与地图，截图目录用来读坐标。手输路径在<b>回车</b>或点到别处时生效。</div>
-          <div class="hint">监控仅在日志确认本地 PvE 战局后启动；在线 PvP / PvE 时模块完全隐藏。提高游戏日志级别需要管理员确认，配置会备份并在关闭监控或退出程序后于游戏退出时恢复。</div>
+          <div class="hint">监控仅在日志确认本地 PvE 战局后启动；在线 PvP / PvE 时模块完全隐藏。提高游戏日志级别需要管理员确认，配置会先备份、写入后核验并长期保留；关闭监控、进入在线战局或退出程序均不自动恢复。游戏更新或启动器修复后请重新应用。</div>
+        </section>
+        <section class="settings-card">
+          <h3>首领监控 · 1.0.16</h3>
+          <label class="row"><input type="checkbox" id="set-boss-notifications" /> 主窗口最小化期间通知新确认刷新的首领</label>
+          <label>监控地图 <select id="boss-filter-map"></select></label>
+          <label>首领范围 <select id="boss-filter-mode"><option value="all">所有首领</option><option value="selected">仅所选首领</option><option value="off">不监控本图首领</option></select></label>
+          <div id="boss-filter-roles" class="boss-filter-roles"></div>
+          <div class="hint">选择首领同时包含其随从；Rogue、Raider、AI PMC 与 BTR 独立显示。位置为日志初始位置。设置即时保存。</div>
         </section>
         <section class="settings-card">
           <h3>定位与显示</h3>

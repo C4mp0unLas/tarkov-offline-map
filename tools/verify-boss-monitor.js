@@ -48,6 +48,8 @@ async function run() {
     if (!mini) throw new Error('Minimap did not open');
     const pages = [main, mini];
     for (const page of pages) {
+      // Capture real desktop input before map wheel handlers while preserving programmatic CDP/UI checks.
+      await evaluate(page.webSocketDebuggerUrl, `(() => { for (const type of ["wheel","pointerdown","mousedown"]) window.addEventListener(type, e => { if (e.isTrusted) { e.preventDefault(); e.stopImmediatePropagation(); } }, { capture: true, passive: false }); })()`);
       // Desktop input must not pan a test window during the stability sample.
       await cdp(page.webSocketDebuggerUrl, [['Input.setIgnoreInputEvents', { ignore: true }]]);
       await evaluate(page.webSocketDebuggerUrl, 'window.dispatchEvent(new MouseEvent("mouseup"))');
@@ -157,7 +159,33 @@ async function run() {
       })()`);
       report.check((i ? '悬浮地图' : '主地图') + '状态和视角更新复用首领图标', result.recolored && result.moved && result.retained, JSON.stringify(result));
     }
-    fs.appendFileSync(appFile, line('Matching with group id: 19', 'application', '08'));
+    fs.appendFileSync(aiFile, [
+      ['bossScourgeEventLab', 'scourge', 20], ['followerScourgeEventLab', 'scourgeguard', 21],
+      ['exUsecFree', 'rogue', 22], ['pmcBot', 'raider', 23],
+    ].map(([role, profile, id]) => line('Bot activate role:' + role + ' pos:(2,3,4) profileId:' + profile + ' id:' + id, 'aiData', '09')).join(''));
+    report.check('1.0.16 新角色在实际日志管线中显示原名与计数', await waitFor(async () =>
+      (await rowText('Scourge')).includes('推测存活 1') && (await rowText('Scourge 随从')).includes('推测存活 1')
+      && (await rowText('Rogue · 游荡者')).includes('实际激活 1') && (await rowText('Raider · 掠夺者')).includes('实际激活 1'), 5000));
+    fs.appendFileSync(aiFile, deathLogs([20, 21, 22, 23], '10'));
+    report.check('Scourge 及随从、Rogue 和 Raider 均更新确认死亡', await waitFor(async () =>
+      (await rowText('Scourge')).includes('死亡已确认 1') && (await rowText('Scourge 随从')).includes('死亡已确认 1')
+      && (await rowText('Rogue · 游荡者')).includes('死亡已确认 1') && (await rowText('Raider · 掠夺者')).includes('死亡已确认 1'), 5000));
+    await evaluate(main.webSocketDebuggerUrl, 'window.api.setConfig({ bossMapFilters: { woods: { mode: "selected", roles: ["bossScourgeEventLab"] } } })');
+    report.check('按地图筛选同时更新面板与悬浮图标', await waitFor(async () => {
+      const state = await evaluate(main.webSocketDebuggerUrl, 'window.api.getState()');
+      return state.bossMonitor.bosses.length === 1 && state.bossMonitor.bosses[0].name === 'Scourge'
+        && state.bossMonitor.markers.length === 1 && state.bossMonitor.specialAis.length === 2;
+    }, 5000));
+    await evaluate(main.webSocketDebuggerUrl, 'window.api.setConfig({ bossMapFilters: { woods: { mode: "all", roles: [] } } })');
+    await evaluate(main.webSocketDebuggerUrl, 'document.getElementById("btn-settings").click()');
+    report.check('设置页实际打开并提供 Scourge 筛选选项', await waitFor(() => evaluate(main.webSocketDebuggerUrl,
+      'document.getElementById("boss-filter-map").options.length > 0 && document.getElementById("boss-filter-roles").textContent.includes("Scourge")'), 5000));
+    const logging = await evaluate(main.webSocketDebuggerUrl, 'window.api.applyBossLogging()');
+    report.check('设置页 IPC 实际核验已就绪配置', logging.state === 'configured' && logging.ok === true);
+    await evaluate(main.webSocketDebuggerUrl, 'document.getElementById("settings-close").click()');
+    report.check('设置界面含日志核验、长期保留说明与地图筛选', await evaluate(main.webSocketDebuggerUrl,
+      '!!document.getElementById("set-boss-apply") && !!document.getElementById("boss-filter-mode") && document.body.textContent.includes("不自动恢复")'));
+    fs.appendFileSync(appFile, line('Matching with group id: 19', 'application', '11'));
     for (const [i, page] of pages.entries()) {
       const hidden = await waitFor(() => evaluate(page.webSocketDebuggerUrl, `(() => {
         const panel = document.getElementById('boss-panel') || document.getElementById('mini-boss-status');

@@ -22,6 +22,7 @@ export const LIVE_FIELDS = [
   { sel: '#set-logs', path: 'logsPath', kind: 'str' },
   { sel: '#set-shots', path: 'screenshotsPath', kind: 'str' },
   { sel: '#set-game-path', path: 'gamePath', kind: 'str' },
+  { sel: '#set-boss-notifications', path: 'bossNotifications', kind: 'bool' },
   { sel: '#set-boss-monitor', path: 'bossMonitorEnabled', kind: 'bool' },
   // ---- 定位与显示 ----
   { sel: '#set-auto-zoom', path: 'autoZoom', kind: 'bool' },
@@ -69,6 +70,7 @@ export const LIVE_FIELDS = [
 /** 设置页里"只做事、不写配置"的控件（选了目录、打开文件夹、按下按键捕获…） */
 export const LIVE_ACTIONS = [
   '#set-logs-pick', '#set-logs-open', '#set-shots-pick', '#set-shots-open', '#set-game-path-pick', '#set-game-path-open',
+  '#set-boss-apply', '#set-boss-discover',
   '#set-autoshot-capture', '#settings-about', '#settings-close',
   '#room-test', '#room-connect', '#room-disconnect',
 ];

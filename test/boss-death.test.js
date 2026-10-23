@@ -20,7 +20,7 @@ function fixture() {
   feed('GameStarted: Woods', 'application', '03.000');
   return { monitor, feed };
 }
-const entities = state => [...state.bosses, ...state.followers, ...state.pmcs].flatMap(row => row.entities);
+const entities = state => [...state.bosses, ...state.followers, ...state.pmcs, ...(state.specialAis || [])].flatMap(row => row.entities);
 
 test('death pairs update every supported PMC, boss and follower role without duplicate deaths', () => {
   const { monitor, feed } = fixture();
